@@ -2,8 +2,6 @@
 FastNystromAttention - A drop-in replacement for PyTorch's MultiheadAttention
 that uses the Nyström method to approximate attention with better efficiency.
 """
-from __future__ import annotations
-
 from typing import Optional, Tuple
 
 import torch
@@ -11,7 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from einops import rearrange
-from pytorch3d.ops import sample_farthest_points as fps
+from torch_cluster import fps
 
 
 
@@ -35,6 +33,7 @@ def sample_landmarks(
     Returns:
         Indices of sampled landmarks [bsz, num_landmarks]
     """
+
     device = x.device
     bsz = x.shape[0]
     N = x.shape[-2]
@@ -45,7 +44,28 @@ def sample_landmarks(
     if exclude_mask is None:
         exclude_mask = torch.zeros(bsz, N, dtype=torch.bool, device=device)
 
-    # Flatten x for sampling if needed
+    # Masks
+    restricted_mask = ~guarantee_mask & ~exclude_mask           # eligible for sampling
+    available_mask = ~exclude_mask                              # all usable points
+    guarantee_count = guarantee_mask.sum(dim=1)                 # [bsz]
+    available_count = available_mask.sum(dim=1)                 # [bsz]
+    restricted_samples = num_landmarks - guarantee_count        # [bsz]
+    max_restricted = restricted_samples.max().item()
+
+    # Handle full fallback case where num_landmarks >= available_count
+    fallback = num_landmarks >= available_count                 # [bsz]
+    all_indices = torch.arange(N, device=device).unsqueeze(0).expand(bsz, -1)  # [bsz, N]
+
+    valid_indices = torch.where(available_mask, all_indices, N)  # pad invalids with N (out-of-range sentinel)
+    valid_indices = valid_indices.sort(dim=1).values[:, :num_landmarks]       # truncate to num_landmarks
+    valid_indices[fallback.unsqueeze(1).expand_as(valid_indices) == 0] = N     # mask non-fallback rows
+
+    # Top-k restricted indices for sampling
+    restricted_count = restricted_mask.sum(dim=1)
+    max_count = restricted_count.max().item()
+    topk_indices = torch.topk(restricted_mask.int(), k=max_count, dim=1).indices  # [bsz, max_count]
+
+    # Flatten x for sampling
     if x.ndim == 4:
         points = rearrange(x, 'b h n d -> b n (h d)')
     elif x.ndim == 3:
@@ -53,72 +73,50 @@ def sample_landmarks(
     else:
         raise ValueError(f"Invalid input shape: {x.shape}")
 
-    # Determine counts
-    guarantee_count = guarantee_mask.sum(dim=1)                 # [bsz]
-    restricted_mask = ~guarantee_mask & ~exclude_mask           # [bsz, N]
-    restricted_count = restricted_mask.sum(dim=1)               # [bsz]
-    
-    # Determine how many to sample from restricted set
-    needed_from_restricted = num_landmarks - guarantee_count
-    to_sample_count = torch.clamp(needed_from_restricted, min=0)
-    to_sample_count = torch.min(to_sample_count, restricted_count) # [bsz]
-    
-    max_sample_count = to_sample_count.max().item()
-    max_restricted_count = restricted_count.max().item()
-    
-    # Initialize scores for final selection
-    # We will assign high scores to selected indices and use topk
-    scores = torch.full((bsz, N), -1.0, device=device)
-    
-    # 1. Mark guarantee points with highest score
-    scores.masked_fill_(guarantee_mask, 2.0)
-    
-    # 2. Sample from restricted points
-    if max_sample_count > 0 and max_restricted_count > 0:
-        if sample_method == "fps":
-            # Get indices of restricted points
-            topk_result = torch.topk(restricted_mask.int(), k=max_restricted_count, dim=1)
-            candidate_indices = topk_result.indices # [bsz, max_restricted_count]
-            
-            # Gather points
-            candidate_points = points.gather(1, candidate_indices.unsqueeze(-1).expand(-1, -1, points.shape[-1]))
-            
-            # Run FPS
-            # We use K=to_sample_count (tensor) as per user example
-            _, fps_local_indices = fps(
-                candidate_points,
-                lengths=restricted_count,
-                K=to_sample_count
-            )
-            
-            # Mask invalid indices (if any padding occurred)
-            valid_fps_mask = torch.arange(fps_local_indices.shape[1], device=device)[None, :] < to_sample_count[:, None]
-            
-            # Map back to global indices
-            safe_fps_indices = fps_local_indices.clamp(min=0, max=max_restricted_count-1)
-            sampled_indices = candidate_indices.gather(1, safe_fps_indices)
-            
-            # Flatten to scatter scores
-            flat_indices = sampled_indices + (torch.arange(bsz, device=device) * N)[:, None]
-            flat_indices = flat_indices[valid_fps_mask]
-            
-            flat_scores = scores.view(-1)
-            flat_scores[flat_indices] = 1.0
-            scores = flat_scores.view(bsz, N)
+    points_for_sampling = points.gather(1, topk_indices.unsqueeze(-1).expand(-1, -1, points.shape[-1]))
 
-        elif sample_method == "random":
-            # Random sampling: assign random scores [0, 1] to restricted points
-            # Guarantee points have 2.0, so they are picked first.
-            # Restricted points have random scores, so top ones are picked next.
-            scores.masked_scatter_(restricted_mask, torch.rand_like(scores) * 1.0)
-            
-        else:
-            raise ValueError(f"Unknown method: {sample_method}")
+    if sample_method == "fps":
+        flat = rearrange(points_for_sampling, 'b n d -> (b n) d')
+        batch = torch.arange(bsz, device=device).repeat_interleave(max_count)
+        ratio = restricted_samples.float() / restricted_count.clamp(min=1).float()
+        fps_indices = fps(flat, batch, ratio=ratio.max().item())  # (global indices)
+        batch_ids = batch[fps_indices]
+        local = fps_indices - batch_ids * max_count
+        fps_local = local.reshape(bsz, -1)[:, :max_restricted]
+        sampled = topk_indices.gather(1, fps_local)
+    elif sample_method == "random":
+        rand = torch.rand(bsz, max_count, device=device)
+        perm = rand.argsort(dim=1)
+        shuffled = topk_indices.gather(1, perm)
+        sampled = shuffled[:, :max_restricted]
+    else:
+        raise ValueError(f"Unknown method: {sample_method}")
 
-    # Select final indices
-    final_indices = torch.topk(scores, k=num_landmarks, dim=1).indices
-    
-    return final_indices
+    # Guaranteed indices
+    guarantee_indices = torch.where(guarantee_mask, all_indices, N)
+    guarantee_indices = guarantee_indices.sort(dim=1).values
+    max_guarantee = guarantee_count.max().item()
+    guarantee_indices = guarantee_indices[:, :max_guarantee]
+
+    # Pad sampled to ensure combined has num_landmarks
+    sampled_pad_len = (num_landmarks - max_guarantee) - sampled.shape[1]
+    if sampled_pad_len > 0:
+        sampled_pad = torch.full((bsz, sampled_pad_len), -1, dtype=torch.long, device=device)
+        sampled = torch.cat([sampled, sampled_pad], dim=1)
+
+    # Combine sampled + guaranteed
+    combined = torch.cat([sampled, guarantee_indices], dim=1)[:, :num_landmarks]
+
+    # Pad fallback indices to shape
+    pad_len = num_landmarks - valid_indices.shape[1]
+    if pad_len > 0:
+        pad = torch.full((bsz, pad_len), -1, dtype=torch.long, device=device)
+        valid_indices = torch.cat([valid_indices, pad], dim=1)
+    else:
+        valid_indices = valid_indices[:, :num_landmarks]
+
+    # Final: use fallback for batches that need it
+    return torch.where(fallback.unsqueeze(1), valid_indices, combined)
 
 
 def _invert(A: torch.Tensor) -> torch.Tensor:

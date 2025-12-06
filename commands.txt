@@ -1,0 +1,33 @@
+### llava vqa evaluation
+
+# Baseline
+CUDA_VISIBLE_DEVICES=1 \
+python experiments/llava/eval/coco_vqa_eval.py \
+	--model-id llava-hf/llava-v1.6-vicuna-7b-hf \
+	--questions-json /home/andrew/codebases/tmp/COCO/annotations/v2_OpenEnded_mscoco_val2014_questions_shortened_100.json \
+	--annotations-json /home/andrew/codebases/tmp/COCO/annotations/v2_mscoco_val2014_annotations_shortened_100.json \
+	--images-root /home/andrew/codebases/tmp/COCO \
+	--output-dir ./experiments/llava/eval/outputs/coco_vqa/llava_baseline \
+	--disable-fna
+
+
+CUDA_VISIBLE_DEVICES=1 \
+python experiments/llava/eval/coco_vqa_eval.py \
+	--model-id llava-hf/llava-v1.6-vicuna-7b-hf \
+	--questions-json /home/andrew/codebases/tmp/COCO/annotations/v2_OpenEnded_mscoco_val2014_questions_shortened_100.json \
+	--annotations-json /home/andrew/codebases/tmp/COCO/annotations/v2_mscoco_val2014_annotations_shortened_100.json \
+	--images-root /home/andrew/codebases/tmp/COCO \
+	--output-dir ./experiments/llava/eval/outputs/coco_vqa/llava_fna-12_32-256-img_toks \
+	--fna-layer-range 12:32 --fna-num-sample 256 \
+	--fna-sampling-strategy fps
+
+
+CUDA_VISIBLE_DEVICES=1 \
+python experiments/llava/eval/coco_vqa_eval.py \
+	--model-id llava-hf/llava-v1.6-vicuna-7b-hf \
+	--questions-json /home/andrew/codebases/tmp/COCO/annotations/v2_OpenEnded_mscoco_val2014_questions_shortened_100.json \
+	--annotations-json /home/andrew/codebases/tmp/COCO/annotations/v2_mscoco_val2014_annotations_shortened_100.json \
+	--images-root /home/andrew/codebases/tmp/COCO \
+	--output-dir ./experiments/llava/eval/outputs/coco_vqa/llava_fna-12_32-256-img_toks_random \
+	--fna-layer-range 12:32 --fna-num-sample 256 \
+	--fna-sampling-strategy random

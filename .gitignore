@@ -3,6 +3,8 @@ backup
 experiments_private
 ncut_visualizations
 diffusion_wentinn
+mta_vision_transformers
+mta_vision_transformers_updated
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -1,0 +1,14 @@
+{
+  "num_questions": 100,
+  "num_predicted": 100,
+  "accuracy": 0.0,
+  "avg_latency_s": 1.3250611871806905,
+  "median_latency_s": 1.6734630534992903,
+  "avg_generated_tokens": 35.57,
+  "avg_tokens_per_s": 26.844043387673036,
+  "avg_generation_latency_s": 0.9071838960524474,
+  "avg_generation_tokens_per_s": 39.209249805668485,
+  "bertscore_precision": null,
+  "bertscore_recall": null,
+  "bertscore_f1": null
+}

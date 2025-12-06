@@ -1,6 +1,8 @@
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import warnings
+
 import torch
 import torch.nn as nn
 
@@ -24,6 +26,36 @@ class FNACacheMixin:
 
     def update_cache(self, d: Dict[str, Any]) -> None:
         self.fna_cache.update(d)
+
+
+VALID_SAMPLING_STRATEGIES = {"fps", "random"}
+
+
+def normalize_fna_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    cfg = dict(config) if config is not None else {}
+
+    if "resample_every_layer" not in cfg and "resample_fps" in cfg:
+        warnings.warn(
+            "fna_config['resample_fps'] is deprecated; use 'resample_every_layer' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        cfg["resample_every_layer"] = bool(cfg["resample_fps"])
+        del cfg["resample_fps"]
+
+    cfg.setdefault("resample_every_layer", False)
+
+    sampling_strategy = str(cfg.get("sampling_strategy", "fps")).lower()
+    if sampling_strategy not in VALID_SAMPLING_STRATEGIES:
+        raise ValueError(
+            f"Unsupported sampling_strategy '{sampling_strategy}'. Choose from {sorted(VALID_SAMPLING_STRATEGIES)}"
+        )
+    cfg["sampling_strategy"] = sampling_strategy
+
+    cfg.setdefault("fna_layers", [])
+    cfg.setdefault("num_sample", 0)
+
+    return cfg
 
 
 # --------------------
@@ -188,7 +220,7 @@ class CLIPEncoderFNA(CLIPEncoder):
         fna_cache: Optional[Dict[str, Any]] = {}
     ):
         super().__init__(config)
-        self.fna_config = fna_config
+        self.fna_config = normalize_fna_config(fna_config)
         self.fna_cache = fna_cache
 
         # Replace CLIPEncoderLayer with CLIPEncoderLayerFNA
@@ -222,13 +254,13 @@ class CLIPEncoderFNA(CLIPEncoder):
                 "output_attentions": output_attentions
             }
             if idx in self.fna_config['fna_layers']:
-                if self.fna_config['resample_fps'] or sample_indices is None:
+                if self.fna_config['resample_every_layer'] or sample_indices is None:
                     sample_indices = sample_landmarks(
                         hidden_states, 
                         self.fna_config['num_sample'], 
-                        sample_method='fps',
+                        sample_method=self.fna_config['sampling_strategy'],
                         guarantee_mask=mask_dict.get("guarantee"),
-                        exclude_mask= mask_dict.get("exclude"),
+                        exclude_mask=mask_dict.get("exclude"),
                     )
                 layer_args["use_fna"] = True
                 layer_args["sample_indices"] = sample_indices
@@ -266,14 +298,14 @@ class CLIPModelFNA(CLIPModel, FNACacheMixin):
         fna_cache: Optional[Dict[str, Any]] = {}
     ):
         super().__init__(config)
-        self.fna_config = fna_config
+        self.fna_config = normalize_fna_config(fna_config)
         self.fna_cache = fna_cache
 
         # Replace CLIPEncoder with CLIPEncoderFNA
         self.vision_model.encoder = CLIPEncoderFNA.from_clip_encoder(
             self.vision_model.encoder, 
             config.vision_config, 
-            fna_config, 
+            self.fna_config, 
             fna_cache
         )
 
@@ -453,7 +485,8 @@ class LlamaModelFNA(LlamaModel):
         fna_config: Dict[str, Any] = {}, 
         fna_cache: Dict[str, Any] = {}
     ) -> "LlamaModelFNA":
-        fna_model = cls(config, fna_config, fna_cache)
+        normalized_config = normalize_fna_config(fna_config)
+        fna_model = cls(config, normalized_config, fna_cache)
         copy_non_module_attributes(model, fna_model)
         fna_model.load_state_dict(model.state_dict())
         return fna_model
@@ -465,7 +498,7 @@ class LlamaModelFNA(LlamaModel):
         fna_cache: Optional[Dict[str, Any]] = {}
     ):
         super().__init__(config)
-        self.fna_config = fna_config
+        self.fna_config = normalize_fna_config(fna_config)
         self.fna_cache = fna_cache
 
         # Replace LlamaDecoderLayer with LlamaDecoderLayerFNA
@@ -551,15 +584,12 @@ class LlamaModelFNA(LlamaModel):
                 "position_embeddings": position_embeddings,
             }
             
-            #print(f'Layer {layer_idx}')
             if has_image_tokens and layer_idx in self.fna_config['fna_layers']:
-                #print(f"Using FNA in layer {layer_idx}")
-                if self.fna_config['resample_fps'] or sample_indices is None:
-                    #print("Resampling landmarks with FPS")
+                if self.fna_config['resample_every_layer'] or sample_indices is None:
                     sample_indices = sample_landmarks(
                         hidden_states, 
                         self.fna_config['num_sample'], 
-                        sample_method='random',
+                        sample_method=self.fna_config['sampling_strategy'],
                         guarantee_mask=mask_dict.get("guarantee"),
                         exclude_mask=mask_dict.get("exclude"),
                     )
@@ -601,14 +631,15 @@ class LlavaNextForConditionalGenerationFNA(LlavaNextForConditionalGeneration, FN
         fna_cache: Optional[Dict[str, Any]] = {}
     ):
         super().__init__(config)
-        self.fna_config = fna_config
+        normalized_config = normalize_fna_config(fna_config)
+        self.fna_config = normalized_config
         self.fna_cache = fna_cache
 
         # Replace LlamaModel with LlamaModelFNA
         self.language_model.model = LlamaModelFNA.from_llama_model(
             self.language_model.model, 
             config.text_config, 
-            fna_config, 
+            normalized_config, 
             fna_cache
         )
 
