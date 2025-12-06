@@ -8,8 +8,6 @@ validation split. It produces:
 * ``submission.json`` – minimal list of ``{"question_id", "answer"}`` for
   use with the official VQA evaluation server if desired.
 * ``metrics.json`` – locally computed VQA accuracy using the public metric.
-* (optional) ``bertscore.jsonl`` – per-question BERTScore precision/recall/F1
-    when ``--compute-bertscore`` is enabled.
 
 Example usage::
 
@@ -280,26 +278,85 @@ def select_reference_answer(answers: Sequence[str], strategy: str) -> str:
     raise ValueError(f"Unknown reference strategy '{strategy}'")
 
 
+def load_reference_answers(path: Optional[Path]) -> Dict[int, str]:
+    references: Dict[int, str] = {}
+    if path is None:
+        return references
+
+    raw_payload = path.read_text()
+    try:
+        payload = json.loads(raw_payload)
+        entries: Sequence[Dict[str, object]]
+        if isinstance(payload, list):
+            entries = payload
+        elif isinstance(payload, dict) and isinstance(payload.get("data"), list):
+            entries = payload["data"]  # type: ignore[index]
+        else:
+            raise ValueError("Reference JSON must be a list or contain a 'data' list")
+    except json.JSONDecodeError:
+        entries = []
+        for line in raw_payload.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            entries.append(json.loads(line))
+
+    skipped = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            skipped += 1
+            continue
+        if "question_id" not in entry or "answer" not in entry:
+            skipped += 1
+            continue
+        try:
+            question_id = int(entry["question_id"])
+        except (TypeError, ValueError):
+            skipped += 1
+            continue
+        answer_text = str(entry.get("answer", "")).strip()
+        if not answer_text:
+            skipped += 1
+            continue
+        references[question_id] = answer_text
+
+    logging.info(
+        "Loaded %d external reference answers from %s (skipped %d malformed entries)",
+        len(references),
+        path,
+        skipped,
+    )
+    return references
+
+
 def compute_bertscore(
     predictions: Sequence[GenerationRecord],
     annotations: CocoVqaAnnotations,
     output_path: Path,
     args: argparse.Namespace,
 ) -> Optional[Dict[str, float]]:
-    if not annotations.is_available():
+    reference_answers = load_reference_answers(args.bertscore_reference_json)
+    using_external_refs = bool(reference_answers)
+
+    if (not using_external_refs) and (not annotations.is_available()):
         logging.warning("Skipping BERTScore because annotations were not provided.")
         return None
 
     examples: List[Tuple[GenerationRecord, str]] = []
     for record in predictions:
-        answers = annotations.answers_for(record.question_id)
-        if not answers:
-            continue
-        reference = select_reference_answer(answers, args.bertscore_reference_strategy)
+        if using_external_refs:
+            reference = reference_answers.get(record.question_id)
+            if not reference:
+                continue
+        else:
+            answers = annotations.answers_for(record.question_id)
+            if not answers:
+                continue
+            reference = select_reference_answer(answers, args.bertscore_reference_strategy)
         examples.append((record, reference))
 
     if not examples:
-        logging.warning("No overlapping predictions/annotations for BERTScore computation.")
+        logging.warning("No overlapping predictions and references for BERTScore computation.")
         return None
 
     try:
@@ -309,8 +366,16 @@ def compute_bertscore(
             "BERTScore evaluation requires the 'evaluate' package. Install it via 'pip install evaluate bert-score'."
         ) from exc
 
+    reference_desc = (
+        f"{len(reference_answers)} external references"
+        if using_external_refs
+        else "ground-truth annotations"
+    )
     logging.info(
-        "Computing BERTScore on %d predictions using %s", len(examples), args.bertscore_model_type
+        "Computing BERTScore on %d predictions using %s with %s",
+        len(examples),
+        args.bertscore_model_type,
+        reference_desc,
     )
 
     bertscore = evaluate.load("bertscore")
@@ -411,16 +476,24 @@ def image_path(images_root: Path, image_id: int, split: str) -> Path:
     return candidate
 
 
-def prepare_prompt(processor: LlavaNextProcessor, question: str, system_prompt: Optional[str]) -> str:
+def prepare_prompt(
+    processor: LlavaNextProcessor,
+    question: str,
+    system_prompt: Optional[str],
+    answer_guidance: Optional[str],
+) -> str:
     conversation = []
     if system_prompt:
         conversation.append({"role": "system", "content": [{"type": "text", "text": system_prompt}]})
+    user_text = question
+    if answer_guidance:
+        user_text = f"{question}\n\n{answer_guidance.strip()}"
     conversation.append(
         {
             "role": "user",
             "content": [
                 {"type": "image"},
-                {"type": "text", "text": question},
+                {"type": "text", "text": user_text},
             ],
         }
     )
@@ -554,7 +627,7 @@ def generate_answer(
     img_path = image_path(image_root, image_id, split)
     image = Image.open(img_path).convert("RGB")
 
-    prompt = prepare_prompt(processor, question_text, args.system_prompt)
+    prompt = prepare_prompt(processor, question_text, args.system_prompt, args.answer_guidance)
     inputs = processor(images=image, text=prompt, return_tensors="pt")
     inputs = move_batch_to_device(inputs, args.device, torch_dtype)
 
@@ -653,7 +726,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--images-root", type=Path, required=True, help="Path to COCO images root (contains split folders)")
     parser.add_argument("--image-split", default="val2014", help="COCO image split name (default: val2014)")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--max-new-tokens", type=int, default=1024)
+    parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=50)
@@ -661,8 +734,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--device-map", default=None, help="Pass through to transformers.from_pretrained (e.g., 'auto')")
     parser.add_argument("--limit", type=int, default=None, help="Debug option to limit number of questions")
-    parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--system-prompt", default="You are a helpful assistant for visual question answering.")
+    parser.add_argument(
+        "--answer-guidance",
+        default="",
+        #default="Answer the question using a single word or very short phrase. Respond with the answer only.",
+        help="Extra instruction appended to each question to elicit short VQA-style answers (set empty to disable)",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fna-layer-range", default="12:32", help="Inclusive:exclusive layer range using FNA")
     parser.add_argument("--fna-layers", type=int, nargs="*", default=None, help="Explicit list of layers using FNA")
@@ -676,7 +754,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--disable-fna", action="store_true")
     parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--compute-bertscore", action="store_true", help="Compute BERTScore metrics (requires annotations)")
     parser.add_argument(
         "--bertscore-model-type",
         default="microsoft/deberta-large-mnli",
@@ -695,6 +772,12 @@ def parse_args() -> argparse.Namespace:
         default="majority",
         choices=["majority", "first", "concat"],
         help="How to collapse multiple VQA answers into a single BERTScore reference",
+    )
+    parser.add_argument(
+        "--bertscore-reference-json",
+        type=Path,
+        default=None,
+        help="Optional JSON/JSONL file containing alternative reference answers keyed by question_id",
     )
     args = parser.parse_args()
     return args
@@ -741,8 +824,6 @@ def main() -> None:
         write_record(predictions_path, record)
         predictions.append(record)
         known_ids.add(question_id)
-        if len(predictions) % args.log_every == 0:
-            progress.set_postfix(latency=f"{record.latency_s:.2f}s", answer=record.answer[:32])
         maybe_empty_cuda_cache()
 
     dump_submission(submission_path, predictions)
@@ -752,9 +833,8 @@ def main() -> None:
     generation_latencies = [rec.generation_latency_s for rec in predictions if rec.generation_latency_s is not None]
     generation_tokens = [rec.num_generated_tokens for rec in predictions if rec.generation_latency_s is not None]
     bertscore_summary = None
-    if args.compute_bertscore:
-        bertscore_path = args.output_dir / "bertscore.jsonl"
-        bertscore_summary = compute_bertscore(predictions, annotations, bertscore_path, args)
+    bertscore_path = args.output_dir / "bertscore.jsonl"
+    bertscore_summary = compute_bertscore(predictions, annotations, bertscore_path, args)
 
     avg_latency = float(sum(latencies) / len(latencies)) if latencies else None
     avg_generated_tokens = float(sum(tokens) / len(tokens)) if tokens else None

@@ -35,3 +35,7 @@ Useful FNA flags:
 > **Note:** BERTScore evaluation relies on the optional [`evaluate`](https://github.com/huggingface/evaluate) and
 > [`bert-score`](https://github.com/Tiiiger/bert_score) packages. Install them with `pip install evaluate bert-score`
 > before enabling `--compute-bertscore`.
+
+To compare generations against answers from a different model (e.g., GPT) instead of the COCO annotations, supply
+`--bertscore-reference-json /path/to/gpt_answers.json`. The JSON file should contain a list of objects with
+`question_id` and `answer` fields matching the COCO question ids.

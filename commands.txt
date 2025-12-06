@@ -1,5 +1,15 @@
 ### llava vqa evaluation
 
+# GPT4o evaluation baseline
+python -m experiments.llava.chatgpt_vqa \
+    --questions-file /home/andrew/codebases/tmp/COCO/annotations/v2_OpenEnded_mscoco_val2014_questions_shortened_100.json \
+    --output-json ./experiments/llava/eval/outputs/gpt4_answers_shortened_100.json \
+    --image-root /home/andrew/codebases/tmp/COCO/val2014 \
+    --send-images \
+    --model gpt-4o-mini \
+    --resume
+
+
 # Baseline
 CUDA_VISIBLE_DEVICES=1 \
 python experiments/llava/eval/coco_vqa_eval.py \
@@ -8,26 +18,27 @@ python experiments/llava/eval/coco_vqa_eval.py \
 	--annotations-json /home/andrew/codebases/tmp/COCO/annotations/v2_mscoco_val2014_annotations_shortened_100.json \
 	--images-root /home/andrew/codebases/tmp/COCO \
 	--output-dir ./experiments/llava/eval/outputs/coco_vqa/llava_baseline \
+	--bertscore-reference-json ./experiments/llava/eval/outputs/gpt4_answers_shortened_100.json \
 	--disable-fna
 
-
+# FNA
 CUDA_VISIBLE_DEVICES=1 \
 python experiments/llava/eval/coco_vqa_eval.py \
 	--model-id llava-hf/llava-v1.6-vicuna-7b-hf \
 	--questions-json /home/andrew/codebases/tmp/COCO/annotations/v2_OpenEnded_mscoco_val2014_questions_shortened_100.json \
 	--annotations-json /home/andrew/codebases/tmp/COCO/annotations/v2_mscoco_val2014_annotations_shortened_100.json \
 	--images-root /home/andrew/codebases/tmp/COCO \
-	--output-dir ./experiments/llava/eval/outputs/coco_vqa/llava_fna-12_32-256-img_toks \
+	--output-dir ./experiments/llava/eval/outputs/coco_vqa/llava_fna-layers_12_32-samples_256-img_toks \
+	--bertscore-reference-json ./experiments/llava/eval/outputs/gpt4_answers_shortened_100.json \
 	--fna-layer-range 12:32 --fna-num-sample 256 \
 	--fna-sampling-strategy fps
 
+# Automated sweep (baseline + layer/sample grid)
+# Uses GPU 0 by default. Override with `GPU_ID=1 ./experiments/llava/scripts/run_llava_vqa_sweep.sh` if needed.
+./experiments/llava/scripts/run_llava_vqa_sweep.sh
 
-CUDA_VISIBLE_DEVICES=1 \
-python experiments/llava/eval/coco_vqa_eval.py \
-	--model-id llava-hf/llava-v1.6-vicuna-7b-hf \
-	--questions-json /home/andrew/codebases/tmp/COCO/annotations/v2_OpenEnded_mscoco_val2014_questions_shortened_100.json \
-	--annotations-json /home/andrew/codebases/tmp/COCO/annotations/v2_mscoco_val2014_annotations_shortened_100.json \
-	--images-root /home/andrew/codebases/tmp/COCO \
-	--output-dir ./experiments/llava/eval/outputs/coco_vqa/llava_fna-12_32-256-img_toks_random \
-	--fna-layer-range 12:32 --fna-num-sample 256 \
-	--fna-sampling-strategy random
+
+
+
+
+
