@@ -11,114 +11,217 @@ import torch.nn.functional as F
 from torch import nn
 
 from einops import rearrange
-from pytorch3d.ops import sample_farthest_points as fps
+from contextlib import nullcontext
+from pytorch3d.ops import sample_farthest_points as fps_torch3d
+from torch_fps import farthest_point_sampling as fps_torchfps
 
 
 
+def _as_batched_bool_mask(
+    mask: Optional[torch.Tensor],
+    bsz: int,
+    N: int,
+    device: torch.device,
+    name: str,
+) -> torch.Tensor:
+    """Return a [bsz, N] boolean mask on `device`."""
+    if mask is None:
+        return torch.zeros((bsz, N), dtype=torch.bool, device=device)
+
+    mask = mask.to(device=device)
+    if mask.dtype is not torch.bool:
+        mask = mask.bool()
+
+    if mask.ndim == 1:
+        if mask.numel() != N:
+            raise ValueError(f"{name} must have shape [N] or [B,N]; got {tuple(mask.shape)} vs N={N}")
+        mask = mask.unsqueeze(0).expand(bsz, N)
+    elif mask.ndim == 2:
+        if mask.shape != (bsz, N):
+            raise ValueError(f"{name} must have shape [B,N]; got {tuple(mask.shape)} vs {(bsz, N)}")
+    else:
+        raise ValueError(f"{name} must have shape [N] or [B,N]; got {tuple(mask.shape)}")
+
+    return mask
+
+
+def _cuda_device_ctx(t: torch.Tensor):
+    # torch.cuda.device expects an int index (or a "cuda:X" string), not a torch.device
+    if not t.is_cuda:
+        return nullcontext()
+    idx = t.device.index
+    if idx is None:
+        # Shouldn't happen for CUDA tensors, but be defensive.
+        return nullcontext()
+    return torch.cuda.device(idx)
+
+
+@torch.no_grad()
 def sample_landmarks(
-    x: torch.Tensor, 
-    num_landmarks: int, 
-    sample_method: str = "fps",
+    x: torch.Tensor,
+    num_landmarks: int,
+    sample_method: str = "fps",          # "fps" or "random"
+    fps_backend: str = "torchfps",       # "torchfps" or "torch3d"
     guarantee_mask: Optional[torch.Tensor] = None,
     exclude_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    Sample landmarks from input points using specified method.
-    
+    Sample landmark indices from tokens.
+
     Args:
-        x: Input tensor of shape [bsz, N, D] or [bsz, H, N, D]
-        num_landmarks: Number of landmarks to sample
-        sample_method: Sampling method ("fps" or "random")
-        guarantee_mask: Boolean mask of points that must be included [bsz, N]
-        exclude_mask: Boolean mask of points that cannot be included [bsz, N]
-    
+        x: [B,N,D] or [B,H,N,D]
+        num_landmarks: number of indices to return (per batch)
+        sample_method: "fps" or "random"
+        fps_backend: "torchfps" (mask-aware) or "torch3d" (requires packing)
+        guarantee_mask: [N] or [B,N] bool, must be included (may be > num_landmarks; will be truncated)
+        exclude_mask: [N] or [B,N] bool, must not be included
+
     Returns:
-        Indices of sampled landmarks [bsz, num_landmarks]
+        idx: [B, num_landmarks] long
     """
-    device = x.device
+    if num_landmarks < 0:
+        raise ValueError(f"num_landmarks must be >= 0, got {num_landmarks}")
     bsz = x.shape[0]
     N = x.shape[-2]
+    device = x.device
 
-    # Initialize masks
-    if guarantee_mask is None:
-        guarantee_mask = torch.zeros(bsz, N, dtype=torch.bool, device=device)
-    if exclude_mask is None:
-        exclude_mask = torch.zeros(bsz, N, dtype=torch.bool, device=device)
+    if num_landmarks == 0:
+        return torch.empty((bsz, 0), dtype=torch.long, device=device)
 
-    # Flatten x for sampling if needed
+    # Masks -> [B,N] bool
+    guarantee_mask = _as_batched_bool_mask(guarantee_mask, bsz, N, device, "guarantee_mask")
+    exclude_mask = _as_batched_bool_mask(exclude_mask, bsz, N, device, "exclude_mask")
+
+    # Guarantee wins over exclude (robust to bad inputs)
+    exclude_mask = exclude_mask & ~guarantee_mask
+
+    # Points for sampling
     if x.ndim == 4:
-        points = rearrange(x, 'b h n d -> b n (h d)')
+        # [B,H,N,D] -> [B,N,H*D] as a view when possible
+        points = x.transpose(1, 2).reshape(bsz, N, -1)
     elif x.ndim == 3:
         points = x
     else:
-        raise ValueError(f"Invalid input shape: {x.shape}")
+        raise ValueError(f"x must be [B,N,D] or [B,H,N,D], got {tuple(x.shape)}")
+    points = points.contiguous()
 
-    # Determine counts
-    guarantee_count = guarantee_mask.sum(dim=1)                 # [bsz]
-    restricted_mask = ~guarantee_mask & ~exclude_mask           # [bsz, N]
-    restricted_count = restricted_mask.sum(dim=1)               # [bsz]
-    
-    # Determine how many to sample from restricted set
-    needed_from_restricted = num_landmarks - guarantee_count
-    to_sample_count = torch.clamp(needed_from_restricted, min=0)
-    to_sample_count = torch.min(to_sample_count, restricted_count) # [bsz]
-    
-    max_sample_count = to_sample_count.max().item()
-    max_restricted_count = restricted_count.max().item()
-    
-    # Initialize scores for final selection
-    # We will assign high scores to selected indices and use topk
-    scores = torch.full((bsz, N), -1.0, device=device)
-    
-    # 1. Mark guarantee points with highest score
-    scores.masked_fill_(guarantee_mask, 2.0)
-    
-    # 2. Sample from restricted points
-    if max_sample_count > 0 and max_restricted_count > 0:
-        if sample_method == "fps":
-            # Get indices of restricted points
-            topk_result = torch.topk(restricted_mask.int(), k=max_restricted_count, dim=1)
-            candidate_indices = topk_result.indices # [bsz, max_restricted_count]
-            
-            # Gather points
-            candidate_points = points.gather(1, candidate_indices.unsqueeze(-1).expand(-1, -1, points.shape[-1]))
-            
-            # Run FPS
-            # We use K=to_sample_count (tensor) as per user example
-            _, fps_local_indices = fps(
-                candidate_points,
-                lengths=restricted_count,
-                K=to_sample_count
-            )
-            
-            # Mask invalid indices (if any padding occurred)
-            valid_fps_mask = torch.arange(fps_local_indices.shape[1], device=device)[None, :] < to_sample_count[:, None]
-            
-            # Map back to global indices
-            safe_fps_indices = fps_local_indices.clamp(min=0, max=max_restricted_count-1)
-            sampled_indices = candidate_indices.gather(1, safe_fps_indices)
-            
-            # Flatten to scatter scores
-            flat_indices = sampled_indices + (torch.arange(bsz, device=device) * N)[:, None]
-            flat_indices = flat_indices[valid_fps_mask]
-            
-            flat_scores = scores.view(-1)
-            flat_scores[flat_indices] = 1.0
-            scores = flat_scores.view(bsz, N)
+    restricted_mask = (~guarantee_mask) & (~exclude_mask)
+    guarantee_count = guarantee_mask.sum(dim=1)   # [B]
+    restricted_count = restricted_mask.sum(dim=1) # [B]
 
-        elif sample_method == "random":
-            # Random sampling: assign random scores [0, 1] to restricted points
-            # Guarantee points have 2.0, so they are picked first.
-            # Restricted points have random scores, so top ones are picked next.
-            scores.masked_scatter_(restricted_mask, torch.rand_like(scores) * 1.0)
-            
+    # How many we *want* to sample from restricted points
+    need = (num_landmarks - guarantee_count).clamp(min=0)
+    to_sample = torch.minimum(need, restricted_count)  # [B]
+    Kmax = int(to_sample.max().item())
+
+    # Batched FPS results (only used for fps mode)
+    fps_idx_all: Optional[torch.Tensor] = None
+    if sample_method == "fps" and Kmax > 0:
+        if fps_backend == "torchfps":
+            # mask-aware, no candidate packing
+            with _cuda_device_ctx(points):
+                fps_idx_all = fps_torchfps(
+                    points.contiguous(),
+                    restricted_mask.contiguous(),
+                    Kmax,
+                )
+        elif fps_backend == "torch3d":
+            # Pack variable-length restricted points into padded candidates
+            maxR = int(restricted_count.max().item())
+            if maxR > 0:
+                cand_points = points.new_zeros((bsz, maxR, points.shape[-1]))
+                cand_index = torch.zeros((bsz, maxR), dtype=torch.long, device=device)
+
+                for b in range(bsz):
+                    idx = torch.nonzero(restricted_mask[b], as_tuple=False).squeeze(1)
+                    r = int(idx.numel())
+                    if r > 0:
+                        cand_points[b, :r] = points[b, idx]
+                        cand_index[b, :r] = idx
+
+                # torch3d takes constant K; we take Kmax and slice per-batch later
+                _, local = fps_torch3d(cand_points, lengths=restricted_count, K=Kmax)
+                # Map local -> global; clamp for safety
+                local = local.clamp(min=0, max=maxR - 1)
+                fps_idx_all = cand_index.gather(1, local)
+            else:
+                fps_idx_all = torch.empty((bsz, 0), dtype=torch.long, device=device)
         else:
-            raise ValueError(f"Unknown method: {sample_method}")
+            raise ValueError(f"Unknown fps_backend={fps_backend!r}")
 
-    # Select final indices
-    final_indices = torch.topk(scores, k=num_landmarks, dim=1).indices
-    
-    return final_indices
+    elif sample_method == "random":
+        if fps_backend not in ("torchfps", "torch3d"):
+            raise ValueError(f"Unknown fps_backend={fps_backend!r}")
+    else:
+        if sample_method not in ("fps", "random"):
+            raise ValueError(f"Unknown sample_method={sample_method!r}")
+
+    # Assemble final indices directly (no giant scores matrix)
+    out = torch.empty((bsz, num_landmarks), dtype=torch.long, device=device)
+
+    for b in range(bsz):
+        # 1) guarantee indices (deterministic, sorted by index)
+        g = torch.nonzero(guarantee_mask[b], as_tuple=False).squeeze(1)
+        if g.numel() > num_landmarks:
+            # If user over-guarantees, truncate deterministically
+            out[b] = g[:num_landmarks]
+            continue
+
+        rem = num_landmarks - int(g.numel())
+        picked = [g]
+
+        # 2) fill from restricted set
+        if rem > 0:
+            if sample_method == "fps" and Kmax > 0 and int(to_sample[b].item()) > 0:
+                s = fps_idx_all[b, : int(to_sample[b].item())]
+                # defensive filtering (should already be valid):
+                s = s[restricted_mask[b, s]]
+                if g.numel() > 0:
+                    sel = torch.zeros((N,), dtype=torch.bool, device=device)
+                    sel[g] = True
+                    s = s[~sel[s]]
+                s = s[:rem]
+                picked.append(s)
+                rem -= int(s.numel())
+
+            elif sample_method == "random":
+                ridx = torch.nonzero(restricted_mask[b], as_tuple=False).squeeze(1)
+                if ridx.numel() > 0:
+                    take = min(rem, int(ridx.numel()))
+                    perm = torch.randperm(int(ridx.numel()), device=device)[:take]
+                    s = ridx[perm]
+                    picked.append(s)
+                    rem -= int(s.numel())
+
+        idx = torch.cat(picked, dim=0)
+
+        # 3) pad if we still don't have enough (e.g., too much excluded)
+        if idx.numel() < num_landmarks:
+            avail = torch.nonzero(~exclude_mask[b], as_tuple=False).squeeze(1)  # includes guarantee+restricted
+            if avail.numel() == 0:
+                pad_val = torch.zeros((), dtype=torch.long, device=device)
+                pad = pad_val.expand(num_landmarks - idx.numel())
+            else:
+                sel = torch.zeros((N,), dtype=torch.bool, device=device)
+                sel[idx] = True
+                remaining = avail[~sel[avail]]
+                if remaining.numel() == 0:
+                    pad_val = idx[-1] if idx.numel() > 0 else avail[0]
+                    pad = pad_val.expand(num_landmarks - idx.numel())
+                else:
+                    need_pad = num_landmarks - int(idx.numel())
+                    take = remaining[:need_pad]
+                    if take.numel() < need_pad:
+                        # extend deterministically by repeating last
+                        last = take[-1] if take.numel() > 0 else remaining[-1]
+                        extra = last.expand(need_pad - int(take.numel()))
+                        take = torch.cat([take, extra], dim=0)
+                    pad = take
+            idx = torch.cat([idx, pad], dim=0)
+
+        out[b] = idx[:num_landmarks]
+
+    return out
 
 
 def _invert(A: torch.Tensor) -> torch.Tensor:

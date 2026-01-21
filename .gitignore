@@ -2,7 +2,7 @@
 backup
 experiments_private
 ncut_visualizations
-*outputs/
+*outputs*/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

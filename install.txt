@@ -13,3 +13,6 @@ pytorch cuda version must match machine
 
 
 Wentinn's code: transformers==4.46.2
+
+
+python -m pip install torch-fps --no-build-isolation --no-deps -v

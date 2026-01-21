@@ -29,6 +29,7 @@ class FNACacheMixin:
 
 
 VALID_SAMPLING_STRATEGIES = {"fps", "random"}
+VALID_SAMPLING_FEATURES = {"input", "q", "k", "v"}
 
 
 def normalize_fna_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -51,6 +52,13 @@ def normalize_fna_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             f"Unsupported sampling_strategy '{sampling_strategy}'. Choose from {sorted(VALID_SAMPLING_STRATEGIES)}"
         )
     cfg["sampling_strategy"] = sampling_strategy
+
+    sampling_features = str(cfg.get("sampling_features", "input")).lower()
+    if sampling_features not in VALID_SAMPLING_FEATURES:
+        raise ValueError(
+            f"Unsupported sampling_features '{sampling_features}'. Choose from {sorted(VALID_SAMPLING_FEATURES)}"
+        )
+    cfg["sampling_features"] = sampling_features
 
     cfg.setdefault("fna_layers", [])
     cfg.setdefault("num_sample", 0)
@@ -92,8 +100,22 @@ class CLIPFastNystromAttention(CLIPAttention):
         output_attentions: Optional[bool] = False,
         use_fna: Optional[bool] = False,
         sample_indices: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if not use_fna or sample_indices is None:
+        sampling_features: Optional[str] = None,
+        sampling_strategy: Optional[str] = None,
+        num_sample: Optional[int] = None,
+        guarantee_mask: Optional[torch.Tensor] = None,
+        exclude_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:    
+        if not use_fna:
+            self.last_sample_indices = None
+            return super().forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                causal_attention_mask=causal_attention_mask,
+                output_attentions=output_attentions,
+            )
+        if sample_indices is None and sampling_features not in {"q", "k", "v"}:
+            self.last_sample_indices = None
             return super().forward(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
@@ -128,6 +150,33 @@ class CLIPFastNystromAttention(CLIPAttention):
             query_states = query_states.contiguous()
             key_states = key_states.contiguous()
             value_states = value_states.contiguous()
+
+        if sample_indices is None and sampling_features in {"q", "k", "v"}:
+            if num_sample is None:
+                raise ValueError("num_sample must be provided when sampling_features is q/k/v.")
+            source_map = {
+                "q": query_states,
+                "k": key_states,
+                "v": value_states,
+            }
+            sampling_source = source_map[sampling_features].mean(dim=1)
+            sample_indices = sample_landmarks(
+                sampling_source,
+                num_sample,
+                sample_method=sampling_strategy or "fps",
+                guarantee_mask=guarantee_mask,
+                exclude_mask=exclude_mask,
+            )
+
+        if sample_indices is None:
+            self.last_sample_indices = None
+            return super().forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                causal_attention_mask=causal_attention_mask,
+                output_attentions=output_attentions,
+            )
+        self.last_sample_indices = sample_indices
 
         # CLIP text model uses both `causal_attention_mask` and `attention_mask` sequentially.
         attn_output = fast_nystrom_attention(
@@ -174,6 +223,11 @@ class CLIPEncoderLayerFNA(CLIPEncoderLayer):
         output_attentions: Optional[bool] = False,
         use_fna: Optional[bool] = False,
         sample_indices: Optional[torch.Tensor] = None,
+        sampling_features: Optional[str] = None,
+        sampling_strategy: Optional[str] = None,
+        num_sample: Optional[int] = None,
+        guarantee_mask: Optional[torch.Tensor] = None,
+        exclude_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.FloatTensor]:
         residual = hidden_states
 
@@ -185,6 +239,11 @@ class CLIPEncoderLayerFNA(CLIPEncoderLayer):
             output_attentions=output_attentions,
             use_fna=use_fna,
             sample_indices=sample_indices,
+            sampling_features=sampling_features,
+            sampling_strategy=sampling_strategy,
+            num_sample=num_sample,
+            guarantee_mask=guarantee_mask,
+            exclude_mask=exclude_mask,
         )
         hidden_states = residual + hidden_states
 
@@ -254,16 +313,26 @@ class CLIPEncoderFNA(CLIPEncoder):
                 "output_attentions": output_attentions
             }
             if idx in self.fna_config['fna_layers']:
+                sampling_features = self.fna_config["sampling_features"]
+                if not self.fna_config["resample_every_layer"] and sampling_features in {"q", "k", "v"}:
+                    sample_indices = self.fna_cache.get("sample_indices")
                 if self.fna_config['resample_every_layer'] or sample_indices is None:
-                    sample_indices = sample_landmarks(
-                        hidden_states, 
-                        self.fna_config['num_sample'], 
-                        sample_method=self.fna_config['sampling_strategy'],
-                        guarantee_mask=mask_dict.get("guarantee"),
-                        exclude_mask=mask_dict.get("exclude"),
-                    )
+                    if sampling_features == "input":
+                        sampling_source = hidden_states
+                        sample_indices = sample_landmarks(
+                            sampling_source,
+                            self.fna_config['num_sample'], 
+                            sample_method=self.fna_config['sampling_strategy'],
+                            guarantee_mask=mask_dict.get("guarantee"),
+                            exclude_mask=mask_dict.get("exclude"),
+                        )
                 layer_args["use_fna"] = True
                 layer_args["sample_indices"] = sample_indices
+                layer_args["sampling_features"] = sampling_features
+                layer_args["sampling_strategy"] = self.fna_config["sampling_strategy"]
+                layer_args["num_sample"] = self.fna_config["num_sample"]
+                layer_args["guarantee_mask"] = mask_dict.get("guarantee")
+                layer_args["exclude_mask"] = mask_dict.get("exclude")
 
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
@@ -276,6 +345,15 @@ class CLIPEncoderFNA(CLIPEncoder):
                 layer_outputs = encoder_layer(**layer_args)
 
             hidden_states = layer_outputs[0]
+
+            if (
+                idx in self.fna_config['fna_layers']
+                and not self.fna_config["resample_every_layer"]
+                and self.fna_config["sampling_features"] in {"q", "k", "v"}
+            ):
+                sample_indices = getattr(encoder_layer.self_attn, "last_sample_indices", sample_indices)
+                if sample_indices is not None:
+                    self.fna_cache["sample_indices"] = sample_indices
 
             if output_attentions:
                 all_attentions = all_attentions + (layer_outputs[1],)
@@ -362,9 +440,25 @@ class LlamaFastNystromAttention(LlamaAttention):
         cache_position: Optional[torch.LongTensor] = None,
         use_fna: Optional[bool] = False,
         sample_indices: Optional[torch.Tensor] = None,
+        sampling_features: Optional[str] = None,
+        sampling_strategy: Optional[str] = None,
+        num_sample: Optional[int] = None,
+        guarantee_mask: Optional[torch.Tensor] = None,
+        exclude_mask: Optional[torch.Tensor] = None,
         **kwargs
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        if not use_fna or sample_indices is None:
+        if not use_fna:
+            self.last_sample_indices = None
+            return super().forward(
+                hidden_states=hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                past_key_value=past_key_value,
+                cache_position=cache_position,
+                **kwargs,
+            )
+        if sample_indices is None and sampling_features not in {"q", "k", "v"}:
+            self.last_sample_indices = None
             return super().forward(
                 hidden_states=hidden_states,
                 position_embeddings=position_embeddings,
@@ -386,6 +480,35 @@ class LlamaFastNystromAttention(LlamaAttention):
 
         if kwargs.get("output_attentions", False):
             raise NotImplementedError("Output attentions are not implemented for FastNystromAttention.")
+
+        if sample_indices is None and sampling_features in {"q", "k", "v"}:
+            if num_sample is None:
+                raise ValueError("num_sample must be provided when sampling_features is q/k/v.")
+            source_map = {
+                "q": query_states,
+                "k": key_states,
+                "v": value_states,
+            }
+            sampling_source = source_map[sampling_features].mean(dim=1)
+            sample_indices = sample_landmarks(
+                sampling_source,
+                num_sample,
+                sample_method=sampling_strategy or "fps",
+                guarantee_mask=guarantee_mask,
+                exclude_mask=exclude_mask,
+            )
+
+        if sample_indices is None:
+            self.last_sample_indices = None
+            return super().forward(
+                hidden_states=hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                past_key_value=past_key_value,
+                cache_position=cache_position,
+                **kwargs,
+            )
+        self.last_sample_indices = sample_indices
         
         attn_output, (key_landmarks, value_landmarks) = fast_nystrom_attention(
             query_states,
@@ -443,6 +566,11 @@ class LlamaDecoderLayerFNA(LlamaDecoderLayer):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         use_fna: Optional[bool] = False,
         sample_indices: Optional[torch.Tensor] = None,
+        sampling_features: Optional[str] = None,
+        sampling_strategy: Optional[str] = None,
+        num_sample: Optional[int] = None,
+        guarantee_mask: Optional[torch.Tensor] = None,
+        exclude_mask: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
@@ -459,6 +587,11 @@ class LlamaDecoderLayerFNA(LlamaDecoderLayer):
             position_embeddings=position_embeddings,
             use_fna=use_fna,
             sample_indices=sample_indices,
+            sampling_features=sampling_features,
+            sampling_strategy=sampling_strategy,
+            num_sample=num_sample,
+            guarantee_mask=guarantee_mask,
+            exclude_mask=exclude_mask,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -585,16 +718,26 @@ class LlamaModelFNA(LlamaModel):
             }
             
             if has_image_tokens and layer_idx in self.fna_config['fna_layers']:
+                sampling_features = self.fna_config["sampling_features"]
+                if not self.fna_config["resample_every_layer"] and sampling_features in {"q", "k", "v"}:
+                    sample_indices = self.fna_cache.get("sample_indices")
                 if self.fna_config['resample_every_layer'] or sample_indices is None:
-                    sample_indices = sample_landmarks(
-                        hidden_states, 
-                        self.fna_config['num_sample'], 
-                        sample_method=self.fna_config['sampling_strategy'],
-                        guarantee_mask=mask_dict.get("guarantee"),
-                        exclude_mask=mask_dict.get("exclude"),
-                    )
+                    if sampling_features == "input":
+                        sampling_source = hidden_states
+                        sample_indices = sample_landmarks(
+                            sampling_source,
+                            self.fna_config['num_sample'], 
+                            sample_method=self.fna_config['sampling_strategy'],
+                            guarantee_mask=mask_dict.get("guarantee"),
+                            exclude_mask=mask_dict.get("exclude"),
+                        )
                 layer_args["use_fna"] = True
                 layer_args["sample_indices"] = sample_indices
+                layer_args["sampling_features"] = sampling_features
+                layer_args["sampling_strategy"] = self.fna_config["sampling_strategy"]
+                layer_args["num_sample"] = self.fna_config["num_sample"]
+                layer_args["guarantee_mask"] = mask_dict.get("guarantee")
+                layer_args["exclude_mask"] = mask_dict.get("exclude")
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
@@ -605,6 +748,16 @@ class LlamaModelFNA(LlamaModel):
                 layer_outputs = decoder_layer(**layer_args, **flash_attn_kwargs)
 
             hidden_states = layer_outputs[0]
+
+            if (
+                has_image_tokens
+                and layer_idx in self.fna_config['fna_layers']
+                and not self.fna_config["resample_every_layer"]
+                and self.fna_config["sampling_features"] in {"q", "k", "v"}
+            ):
+                sample_indices = getattr(decoder_layer.self_attn, "last_sample_indices", sample_indices)
+                if sample_indices is not None:
+                    self.fna_cache["sample_indices"] = sample_indices
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
