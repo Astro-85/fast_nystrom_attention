@@ -794,8 +794,9 @@ def maybe_empty_cuda_cache() -> None:
         torch.cuda.empty_cache()
 
 
-def main() -> None:
-    args = parse_args()
+def run_coco_eval(args: argparse.Namespace) -> None:
+    if not (args.questions_json and args.images_root and args.output_dir):
+        raise ValueError("required arguments not specified")
     configure_logging(args.verbose)
     set_random_seed(args.seed)
 
@@ -805,7 +806,7 @@ def main() -> None:
     predictions_path = args.output_dir / "predictions.jsonl"
     submission_path = args.output_dir / "submission.json"
     metrics_path = args.output_dir / "metrics.json"
-
+    
     questions = load_questions(args.questions_json, args.limit)
     annotations = CocoVqaAnnotations(args.annotations_json)
 
@@ -814,6 +815,7 @@ def main() -> None:
     predictions: List[GenerationRecord] = list(existing_predictions)
 
     model, processor = load_model_and_processor(args, torch_dtype)
+
 
     progress = tqdm(questions, desc="COCO VQA", unit="q")
     for payload in progress:
@@ -865,6 +867,13 @@ def main() -> None:
     dump_metrics(metrics_path, summary)
 
     logging.info("Evaluation complete: %s", json.dumps(summary.to_json(), indent=2))
+
+
+
+
+def main() -> None:
+    args = parse_args()
+    run_coco_eval(args)
 
 
 if __name__ == "__main__":
