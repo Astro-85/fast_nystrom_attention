@@ -1,8 +1,6 @@
 # Large checkpoints
-backup
-experiments_private
-ncut_visualizations
 *outputs*/
+*IGNORE*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

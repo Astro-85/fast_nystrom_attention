@@ -11,9 +11,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from einops import rearrange
-from contextlib import nullcontext
-from pytorch3d.ops import sample_farthest_points as fps_torch3d
-from torch_fps import farthest_point_sampling as fps_torchfps
+import torch_quickfps
 
 
 
@@ -45,23 +43,11 @@ def _as_batched_bool_mask(
     return mask
 
 
-def _cuda_device_ctx(t: torch.Tensor):
-    # torch.cuda.device expects an int index (or a "cuda:X" string), not a torch.device
-    if not t.is_cuda:
-        return nullcontext()
-    idx = t.device.index
-    if idx is None:
-        # Shouldn't happen for CUDA tensors, but be defensive.
-        return nullcontext()
-    return torch.cuda.device(idx)
-
-
 @torch.no_grad()
 def sample_landmarks(
     x: torch.Tensor,
     num_landmarks: int,
     sample_method: str = "fps",          # "fps" or "random"
-    fps_backend: str = "torchfps",       # "torchfps" or "torch3d"
     guarantee_mask: Optional[torch.Tensor] = None,
     exclude_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -72,7 +58,6 @@ def sample_landmarks(
         x: [B,N,D] or [B,H,N,D]
         num_landmarks: number of indices to return (per batch)
         sample_method: "fps" or "random"
-        fps_backend: "torchfps" (mask-aware) or "torch3d" (requires packing)
         guarantee_mask: [N] or [B,N] bool, must be included (may be > num_landmarks; will be truncated)
         exclude_mask: [N] or [B,N] bool, must not be included
 
@@ -117,44 +102,16 @@ def sample_landmarks(
     # Batched FPS results (only used for fps mode)
     fps_idx_all: Optional[torch.Tensor] = None
     if sample_method == "fps" and Kmax > 0:
-        if fps_backend == "torchfps":
-            # mask-aware, no candidate packing
-            with _cuda_device_ctx(points):
-                fps_idx_all = fps_torchfps(
-                    points.contiguous(),
-                    restricted_mask.contiguous(),
-                    Kmax,
-                )
-        elif fps_backend == "torch3d":
-            # Pack variable-length restricted points into padded candidates
-            maxR = int(restricted_count.max().item())
-            if maxR > 0:
-                cand_points = points.new_zeros((bsz, maxR, points.shape[-1]))
-                cand_index = torch.zeros((bsz, maxR), dtype=torch.long, device=device)
-
-                for b in range(bsz):
-                    idx = torch.nonzero(restricted_mask[b], as_tuple=False).squeeze(1)
-                    r = int(idx.numel())
-                    if r > 0:
-                        cand_points[b, :r] = points[b, idx]
-                        cand_index[b, :r] = idx
-
-                # torch3d takes constant K; we take Kmax and slice per-batch later
-                _, local = fps_torch3d(cand_points, lengths=restricted_count, K=Kmax)
-                # Map local -> global; clamp for safety
-                local = local.clamp(min=0, max=maxR - 1)
-                fps_idx_all = cand_index.gather(1, local)
-            else:
-                fps_idx_all = torch.empty((bsz, 0), dtype=torch.long, device=device)
-        else:
-            raise ValueError(f"Unknown fps_backend={fps_backend!r}")
-
-    elif sample_method == "random":
-        if fps_backend not in ("torchfps", "torch3d"):
-            raise ValueError(f"Unknown fps_backend={fps_backend!r}")
-    else:
-        if sample_method not in ("fps", "random"):
-            raise ValueError(f"Unknown sample_method={sample_method!r}")
+        fps_idx_all = torch_quickfps.sample(
+            points,
+            Kmax,
+            mask=restricted_mask,
+            h=8,
+            low_d=8,
+            return_points=False,
+        )
+    elif sample_method not in ("fps", "random"):
+        raise ValueError(f"Unknown sample_method={sample_method!r}")
 
     # Assemble final indices directly (no giant scores matrix)
     out = torch.empty((bsz, num_landmarks), dtype=torch.long, device=device)
