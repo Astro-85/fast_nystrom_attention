@@ -43,8 +43,27 @@ Start with the demo notebook in [experiments/llava/llava_demo.ipynb](experiments
 
 For benchmark sweeps, use the scripts in [experiments/llava/scripts/](experiments/llava/scripts/):
 
-- [Run GPT-based evals](experiments/llava/scripts/run_llava_bench_gpt_eval_dir.sh)
 - [Run sweep](experiments/llava/scripts/run_llava_bench_sweep.sh)
+- [Run GPT-based evals](experiments/llava/scripts/run_llava_bench_gpt_eval_dir.sh)
+
+Minimum setup for LLaVA-Bench requires the dataset files. Example sweep command (adjust paths and GPU as needed):
+
+```bash
+GPU_ID=0 \
+QUESTIONS_JSONL=/path/to/questions.jsonl \
+IMAGES_ROOT=/path/to/images \
+./experiments/llava/scripts/run_llava_bench_sweep.sh
+```
+
+Example GPT-based eval over a runs directory:
+
+```bash
+EVAL_MODEL=gpt-4o-mini \
+QUESTIONS_JSONL=/path/to/questions.jsonl \
+ANSWERS_GPT4_JSONL=/path/to/answers_gpt4.jsonl \
+CONTEXT_JSONL=/path/to/context.jsonl \
+./experiments/llava/scripts/run_llava_bench_gpt_eval_dir.sh ./experiments/llava/eval/outputs_q_fpsample/llava_bench
+```
 
 ---
 
