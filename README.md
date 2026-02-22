@@ -31,11 +31,20 @@ Official repository for [Artifacts and Attention Sinks: Structured Approximation
   python -m pip install -r requirements.txt
   ```
 
-5. Sanity check:
+## Experiments
 
-  ```bash
-  python -c "import torch; import transformers; print('torch', torch.__version__); print('transformers', transformers.__version__)"
-  ```
+### CLIP
+
+Run the COCO retrieval notebook in [experiments/clip/clip_coco_retrieval.ipynb](experiments/clip/clip_coco_retrieval.ipynb).
+
+### LLaVA
+
+Start with the demo notebook in [experiments/llava/llava_demo.ipynb](experiments/llava/llava_demo.ipynb).
+
+For benchmark sweeps, use the scripts in [experiments/llava/scripts/](experiments/llava/scripts/):
+
+- [Run GPT-based evals](experiments/llava/scripts/run_llava_bench_gpt_eval_dir.sh)
+- [Run sweep](experiments/llava/scripts/run_llava_bench_sweep.sh)
 
 ---
 
