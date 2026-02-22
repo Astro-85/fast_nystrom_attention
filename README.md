@@ -4,38 +4,38 @@ Official repository for [Artifacts and Attention Sinks: Structured Approximation
 
 ## Installation
 
-```bash
-conda create -n fna python=3.10 -y
-conda activate fna
-python -m pip install -U pip
-```
+1. Create an environment:
 
-Install the PyTorch build for your CUDA:
+  ```bash
+  conda create -n fna python=3.10 -y
+  conda activate fna
+  python -m pip install -U pip
+  ```
 
-```bash
-# CUDA 12.8 example (adjust for your CUDA)
-python -m pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision
-```
+2. Install the PyTorch build for your CUDA:
 
-Install [torch-quickfps](https://github.com/Astro-85/torch_quickfps) for your CUDA (example):
+  ```bash
+  # CUDA 12.8 example (adjust for your CUDA)
+  python -m pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision
+  ```
 
-```bash
-python -m pip install torch-quickfps-cu128
-```
+3. Install [torch-quickfps](https://github.com/Astro-85/torch_quickfps) for your CUDA (example):
 
-Install project deps:
+  ```bash
+  python -m pip install torch-quickfps-cu128
+  ```
 
-```bash
-python -m pip install -r requirements.txt
-```
+4. Install project deps:
 
-Sanity check:
+  ```bash
+  python -m pip install -r requirements.txt
+  ```
 
-```bash
-python -c "import torch; import transformers; print('torch', torch.__version__); print('transformers', transformers.__version__)"
-```
+5. Sanity check:
 
-Add this section to the **bottom of your README**:
+  ```bash
+  python -c "import torch; import transformers; print('torch', torch.__version__); print('transformers', transformers.__version__)"
+  ```
 
 ---
 
