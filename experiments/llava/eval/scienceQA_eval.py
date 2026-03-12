@@ -74,12 +74,47 @@ import torch
 import string
 from typing import List, Set
 
+
+def normalize_text(text: str) -> str:
+    text = text.strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    text = text.translate(str.maketrans("", "", string.punctuation))
+    return text
+
+
+def extract_predicted_choice_text(decoded: str, answer_choices: List[str]) -> str:
+    cleaned = decoded.strip()
+
+    # exact normalized match
+    norm_output = normalize_text(cleaned)
+    for choice in answer_choices:
+        if normalize_text(choice) == norm_output:
+            return choice.strip()
+
+    # substring match: model says "the correct answer is mitochondria"
+    for choice in answer_choices:
+        norm_choice = normalize_text(choice)
+        if norm_choice and norm_choice in norm_output:
+            return choice.strip()
+
+    # fallback: choose the most overlapping option
+    output_words = set(norm_output.split())
+    best_choice = ""
+    best_score = -1
+    for choice in answer_choices:
+        choice_words = set(normalize_text(choice).split())
+        score = len(output_words & choice_words)
+        if score > best_score:
+            best_score = score
+            best_choice = choice.strip()
+
+    return best_choice if best_score > 0 else cleaned
+
+"""
+Obsolete logit processor allowing single character outputs.
+
 class OnlyChoiceLettersProcessor(LogitsProcessor):
-    """
-    At every generation step, mask logits so the model can only emit:
-      - a single letter token representing a valid choice (A/B/C/...)
-      - EOS
-    """
+
 
     def __init__(self, tokenizer, num_choices: int):
         letters = list(string.ascii_uppercase[:num_choices])
@@ -107,7 +142,7 @@ class OnlyChoiceLettersProcessor(LogitsProcessor):
         mask = scores.new_full(scores.shape, float("-inf"))
         mask[:, self.allowed_ids] = 0.0
         return scores + mask
-
+"""
 
 def set_random_seed(seed:int) -> None:
     torch.manual_seed(seed)
@@ -254,11 +289,7 @@ def load_scienceqa_dataset(args: argparse.Namespace) -> Dataset:
 
 
 def prepare_answer_choices(raw_choices: List[str]) -> List[str]:
-    choices = []
-    for i, choice in enumerate(raw_choices):
-        choices.append(f'{string.ascii_uppercase[i]}. ' + choice.strip())
-
-    return choices
+    return [choice.strip() for choice in raw_choices if choice.strip()]
 
 def prepare_prompt(
     processor: LlavaNextProcessor,
@@ -272,9 +303,8 @@ def prepare_prompt(
 Your task is to choose the correct option.
 
 Rules:
-- Output EXACTLY ONE CAPITAL LETTER.
-- The letter MUST be one of: A, B, C, or D.
-- Output ONLY the letter.
+- Output EXACTLY the text of the correct answer choice.
+- Output ONLY the answer text.
 - Do NOT explain your reasoning.
 - Do NOT output anything else.
 
@@ -305,11 +335,6 @@ If you output anything other than a single letter, the answer is incorrect.
     return processor.apply_chat_template(conversation, add_generation_prompt=True)
 
 
-def extract_assistant(res: string) -> string:
-    if "ASSISTANT:" in res:
-        return res.split("ASSISTANT:")[-1].strip()
-    return res.strip()
-
 
 def generate_answer_scienceqa(
     model: LlavaNextForConditionalGenerationFNA,
@@ -325,8 +350,8 @@ def generate_answer_scienceqa(
     answer_choices = list(sample["choices"])
 
     gt_index = sample.get("answer", None)
-    if isinstance(gt_index, int):
-        ground_truth_answer = string.ascii_uppercase[gt_index]
+    if isinstance(gt_index, int) and 0 <= gt_index < len(answer_choices):
+        ground_truth_answer = answer_choices[gt_index].strip()
     else:
         ground_truth_answer = ""
 
@@ -355,15 +380,11 @@ def generate_answer_scienceqa(
 
     do_sample = args.temperature > 0
 
-    n = len(answer_choices)
-    logits_processor = [OnlyChoiceLettersProcessor(processor.tokenizer, n)]
-
     generation_kwargs = {
         "max_new_tokens": args.max_new_tokens,
         "do_sample": do_sample,
         "use_cache": True,
         "pad_token_id": pad_token_id,
-        "logits_processor": logits_processor,
     }
 
     if do_sample:
@@ -384,20 +405,14 @@ def generate_answer_scienceqa(
         sync_fn()
         latency = time.perf_counter() - start
 
-    decoded = processor.tokenizer.decode(
-        output_ids[0],
-        skip_special_tokens=True,
-    )
-
-    
-
-    decoded = extract_assistant(decoded)
+    prompt_len = inputs["input_ids"].shape[1]
+    generated_ids = output_ids[0][prompt_len:]
+    decoded = processor.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
 
     
 
     # ---------- Extract predicted letter ----------
-    m = re.search(r"([A-Z])", decoded)
-    predicted_answer = m.group(1) if m else ""
+    predicted_answer = extract_predicted_choice_text(decoded, answer_choices)
 
     return GenerationRecord(
         question_id=question_id,
@@ -487,7 +502,7 @@ def run_scienceqa_eval(args: argparse.Namespace) -> None:
     avg_latency = float(sum(latencies) / len(latencies)) if latencies else None
     median_latency = float(statistics.median(latencies)) if latencies else None
 
-    num_correct = float(sum([1 for rec in predictions if rec.predicted_answer == rec.ground_truth_answer]))
+    num_correct = float(sum([1 for rec in predictions if normalize_text(rec.predicted_answer) == normalize_text(rec.ground_truth_answer)]))
     accuracy = float(num_correct/len(predictions))
     metrics = ScienceQAMetrics(
         total_questions=len(predictions),
