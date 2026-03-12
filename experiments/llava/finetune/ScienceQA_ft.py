@@ -67,14 +67,14 @@ class DataRow:
         answer = data_row.get("answer", None)
         choices = data_row.get("choices", None)
         if answer is None or choices is None:
-            return None
+            raise ValueError("Data row is missing 'answer' or 'choices' field")
         return choices[answer]
 
     def __prepare_prompt(self, data_row: dict, processor: LlavaNextProcessor) -> str | None:
         question = data_row.get("question", None)
         choices  = data_row.get("choices", None)
         if question is None or choices is None:
-            return None
+            raise ValueError("Data row is missing 'question' field")
 
         choices_text = "\n".join([f"{chr(65+i)}. {c}" for i, c in enumerate(choices)])
         
@@ -131,10 +131,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32", "float64"])
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--device-map", default=None)
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=2e-5)
-    parser.add_argument("--grad-accum-steps", type=int, default=8)
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--save-every", type=int, default=200)
     parser.add_argument("--max-length", type=int, default=1024)
 

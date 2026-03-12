@@ -1,5 +1,5 @@
 """
-This script loads a Llava-Next checkpoint and fine-tunes it on the ScienceQA dataset.
+This script loads a Llava-Next checkpoint and fine-tunes it on the TextVQA dataset.
 """
 
 from PIL import Image
@@ -14,6 +14,7 @@ from typing import Callable, Dict, List, MutableMapping, Optional, Sequence, Tup
 from datasets import load_dataset, Dataset
 from tqdm import tqdm
 import random
+from collections import Counter
 
 import sys
 
@@ -24,9 +25,73 @@ if PROJECT_ROOT not in sys.path:
 from fast_nystrom_attention import LlavaNextForConditionalGenerationFNA
 from transformers import LlavaNextProcessor
 
+
+SYSTEM_PROMPT = """
+You are answering a visual question based on an image.
+
+Your task is to read the image carefully and provide the correct answer.
+
+Rules:
+- The answer must be short and concise.
+- Output only the final answer.
+- Do not include any explanation.
+- Do not include additional text or formatting.
+"""
+
+class DataRow():
+    def __init__(self, data: Dict, processor: LlavaNextProcessor):
+        self.image = self.__extract_image(data)
+        self.prompt = self.__extract_prompt(data, processor)
+        self.gt = self.__extract_gt(data)
+
+
+    def __extract_image(self, data: Dict) -> Image.Image:
+        image = data.get("image", None)
+        return image.convert("RGB") if image else None
+            
+
+    def __extract_gt(self, data: Dict) -> str:
+        answers = data.get("answers", None)
+        
+        if answers is None or len(answers) == 0:
+            raise ValueError("Data row is missing 'answers' field or it is empty")
+        answers = [ans.strip() for ans in answers if isinstance(ans, str) and ans.strip()]
+        counts = Counter(answers)
+        maxCount = -1
+        currAns = None
+        for ans, count in counts.items():
+            if count > maxCount:
+                maxCount = count
+                currAns = ans
+        return currAns
+
+
+        
+    def __extract_prompt(self, data: Dict, processor: LlavaNextProcessor) -> str:
+        question = data.get("question", None)
+
+        if question is None:
+            raise ValueError("Data row is missing 'question' field")
+
+
+        conversation = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user", 
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": question},
+                    {"type": "text", "text": "Answer:"},
+                ],
+            },
+        ]
+
+        return processor.apply_chat_template(conversation, add_generation_prompt=False)
+
+
 def load_textvqa_dataset(args: argparse.Namespace, split: str) -> Dataset:
     return load_dataset(
-        args.textvqa_dataset_name,
+        args.textvqa_hf_dataset,
         split=split,
         cache_dir=str(args.textvqa_cache_dir) if args.textvqa_cache_dir else None,
     )
@@ -97,20 +162,106 @@ def dtype_from_string(name: str) -> torch.dtype:
     return mapping[name]
 
 
+def collate_fn(batch: List[DataRow], args: argparse.Namespace, processor: LlavaNextProcessor) -> Dict[str, torch.Tensor]:
+    batch = [r for r in batch if r.prompt is not None and r.gt is not None]
+    if len(batch) == 0:
+        raise ValueError("All rows in the batch are invalid (missing prompt or ground truth)")
+    prompts = [row.prompt for row in batch]
+    images = [row.image for row in batch]
+
+
+    images = [(img if img is not None else Image.new("RGB", (336,336), (0,0,0))) for img in images]
+
+    ground_truths = [row.gt for row in batch]
+
+    full_prompts = [f"{prompt} {ground_truth}" for prompt, ground_truth in zip(prompts, ground_truths)]
+
+    inputs = processor(
+        text=full_prompts,
+        images=images,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=args.max_length,
+    )
+
+    labels = inputs["input_ids"].clone()
+    tok = processor.tokenizer
+
+    for i, prompt in enumerate(prompts):
+        prompt_ids = tok(
+            prompt,
+            return_tensors="pt",
+            add_special_tokens=False,  
+            truncation=True,
+            max_length=args.max_length,
+        )["input_ids"][0]
+
+        prompt_len = len(prompt_ids)
+        labels[i, :prompt_len] = -100
+
+    labels[inputs["attention_mask"] == 0] = -100
+    inputs["labels"] = labels
+
+    return inputs
+
 
 def save_hf_checkpoint(
     model: LlavaNextForConditionalGenerationFNA, 
     processor: LlavaNextProcessor, 
     output_dir: Path, 
     step: int) -> None:
-    out_dir = output_dir / f"{checkpoint_{step}}"
+    out_dir = output_dir / f"checkpoint_{step}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    unwrapped = model.module if hasattr(model, "module") else model"
+    unwrapped = model.module if hasattr(model, "module") else model
 
     unwrapped.save_pretrained(out_dir)
     processor.save_pretrained(out_dir)
     logging.info("Saved checkpoint %d to %s", step, str(out_dir))
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Fine-tune Llava-Next + FNA on TextVQA")
+    parser.add_argument("--model-id", default="llava-hf/llava-v1.6-vicuna-7b-hf", help="Hugging Face model id or local path")
+    parser.add_argument("--processor-id", default=None, help="Optional processor id (defaults to --model-id)")
+    parser.add_argument("--checkpoint-path", default=None, help="Optional local checkpoint directory overriding --model-id")
+    parser.add_argument("--output-dir", type=Path, required=True)
+
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--fna-layer-range", default="12:32", help="Inclusive:exclusive layer range using FNA")
+    parser.add_argument("--fna-layers", type=int, nargs="*", default=None, help="Explicit list of layers using FNA")
+    parser.add_argument("--fna-num-sample", type=int, default=256)
+    parser.add_argument("--fna-resample-every-layer", action="store_true", help="Resample landmarks before each FNA layer")
+    parser.add_argument(
+        "--fna-sampling-strategy",
+        default="fps",
+        choices=["fps", "random"],
+        help="Sampling strategy used to select landmarks",
+    )
+    parser.add_argument("--disable-fna", action="store_true")
+
+    parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32", "float64"])
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device-map", default=None)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--num-epochs", type=int, default=3)
+    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
+    parser.add_argument("--save-every", type=int, default=200)
+    parser.add_argument("--max-length", type=int, default=1024)
+
+    parser.add_argument("--textvqa-hf-dataset", default="lmms-lab/textvqa", help="Hugging Face dataset id for TextVQA")
+    parser.add_argument("--textvqa-cache-dir", type=Path, default=None)
+
+    parser.add_argument("--use-lora", action="store_true")
+    parser.add_argument("--lora-r", type=int, default=16)
+    parser.add_argument("--lora-alpha", type=int, default=32)
+
+    parser.add_argument("--max-train-samples", type=int, default=None)
+    parser.add_argument("--max-eval-samples", type=int, default=None)
+
+
+    return parser.parse_args()
 
 
 def main():
@@ -123,6 +274,82 @@ def main():
 
     train_ds = load_textvqa_dataset(args, split="train")
     test_ds = load_textvqa_dataset(args, split="validation")
+
+    if args.max_train_samples is not None:
+        train_ds = train_ds.select(range(min(args.max_train_samples, len(train_ds))))
+
+    if args.max_eval_samples is not None:
+        test_ds = test_ds.select(range(min(args.max_eval_samples, len(test_ds))))
+
+    train_rows = [DataRow(data, processor) for data in train_ds]
+    test_rows = [DataRow(data, processor) for data in test_ds]
+
+    collate = partial(collate_fn, args=args, processor=processor)
+
+    train_loader = DataLoader(
+        train_rows, 
+        batch_size=args.batch_size, 
+        shuffle=True, 
+        collate_fn=collate
+        )
+    test_loader = DataLoader(
+        test_rows, 
+        batch_size=args.batch_size, 
+        collate_fn=collate)
+
+    model.train()
+    device = torch.device(args.device)
+    optim = AdamW(model.parameters(), lr=args.lr)
+    optim.zero_grad(set_to_none=True)
+
+    global_step = 0
+
+    for epoch in tqdm(range(args.num_epochs), desc="Epoch"):
+        logging.info("Starting epoch %d/%d", epoch + 1, args.num_epochs)
+        batch_bar = tqdm(enumerate(train_loader), desc="Batches", leave=False)
+        i = -1
+        for i, batch in batch_bar:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = model(**batch)
+            loss = outputs.loss/args.grad_accum_steps
+            loss.backward()
+
+            if (i+1) % args.grad_accum_steps == 0:
+                global_step +=1
+                optim.step()
+                optim.zero_grad(set_to_none=True)
+                if global_step % args.save_every == 0:
+                    save_hf_checkpoint(model, processor, args.output_dir, global_step)
+
+            batch_bar.set_postfix(loss=f"{(loss.item() * args.grad_accum_steps):.4f}")
+
+        remainder = (i+1) % args.grad_accum_steps
+        if remainder != 0:
+            global_step +=1
+            optim.step()
+            optim.zero_grad(set_to_none=True)
+            if global_step % args.save_every == 0:
+                save_hf_checkpoint(model, processor, args.output_dir, global_step)
+
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0.0
+
+    batch_bar = tqdm(enumerate(test_loader), desc="Evaluating", leave=False)
+    for i, batch in batch_bar:
+        batch = {k: v.to(device) for k, v in batch.items()}
+        with torch.no_grad():
+            outputs = model(**batch)
+
+        total_loss += outputs.loss.item()
+        num_batches += 1
+
+
+    avg_loss = total_loss / num_batches if num_batches > 0 else float("inf")
+    logging.info("Evaluation completed. Average loss: %.4f", avg_loss)
+
+
+
 
 
 if __name__ == "__main__":
