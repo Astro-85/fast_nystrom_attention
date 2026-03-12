@@ -1,6 +1,7 @@
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import logging
 import warnings
 
 import torch
@@ -64,6 +65,86 @@ def normalize_fna_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     cfg.setdefault("num_sample", 0)
 
     return cfg
+
+
+def _resolve_qkv_sample_indices(
+    sample_indices: Optional[torch.Tensor],
+    sampling_features: Optional[str],
+    num_sample: Optional[int],
+    sampling_strategy: Optional[str],
+    guarantee_mask: Optional[torch.Tensor],
+    exclude_mask: Optional[torch.Tensor],
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    if sample_indices is not None:
+        return sample_indices
+    if sampling_features not in {"q", "k", "v"}:
+        return None
+    if num_sample is None:
+        raise ValueError("num_sample must be provided when sampling_features is q/k/v.")
+
+    source_map = {
+        "q": query_states,
+        "k": key_states,
+        "v": value_states,
+    }
+    sampling_source = source_map[sampling_features].mean(dim=1)
+    #qkv_mean = torch.stack((query_states, key_states, value_states), dim=0).mean(dim=0)
+    #sampling_source = qkv_mean.mean(dim=1)
+    return sample_landmarks(
+        sampling_source,
+        num_sample,
+        sample_method=sampling_strategy or "fps",
+        guarantee_mask=guarantee_mask,
+        exclude_mask=exclude_mask,
+    )
+
+
+def _resolve_layer_sample_indices(
+    *,
+    sampling_features: str,
+    resample_every_layer: bool,
+    sample_indices: Optional[torch.Tensor],
+    fna_cache: Dict[str, Any],
+    hidden_states: torch.Tensor,
+    num_sample: int,
+    sampling_strategy: str,
+    mask_dict: Dict[str, Optional[torch.Tensor]],
+) -> Optional[torch.Tensor]:
+    if sampling_features in {"q", "k", "v"} and not resample_every_layer:
+        cached = fna_cache.get("sample_indices")
+        if cached is not None:
+            sample_indices = cached
+
+    if sampling_features == "input" and (resample_every_layer or sample_indices is None):
+        sample_indices = sample_landmarks(
+            hidden_states,
+            num_sample,
+            sample_method=sampling_strategy,
+            guarantee_mask=mask_dict.get("guarantee"),
+            exclude_mask=mask_dict.get("exclude"),
+        )
+
+    return sample_indices
+
+
+def _update_cached_sample_indices(
+    *,
+    sampling_features: str,
+    resample_every_layer: bool,
+    fna_cache: Dict[str, Any],
+    attention_module: nn.Module,
+    sample_indices: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    if resample_every_layer or sampling_features not in {"q", "k", "v"}:
+        return sample_indices
+
+    last = getattr(attention_module, "last_sample_indices", sample_indices)
+    if last is not None:
+        fna_cache["sample_indices"] = last
+    return last
 
 
 # --------------------
@@ -151,22 +232,17 @@ class CLIPFastNystromAttention(CLIPAttention):
             key_states = key_states.contiguous()
             value_states = value_states.contiguous()
 
-        if sample_indices is None and sampling_features in {"q", "k", "v"}:
-            if num_sample is None:
-                raise ValueError("num_sample must be provided when sampling_features is q/k/v.")
-            source_map = {
-                "q": query_states,
-                "k": key_states,
-                "v": value_states,
-            }
-            sampling_source = source_map[sampling_features].mean(dim=1)
-            sample_indices = sample_landmarks(
-                sampling_source,
-                num_sample,
-                sample_method=sampling_strategy or "fps",
-                guarantee_mask=guarantee_mask,
-                exclude_mask=exclude_mask,
-            )
+        sample_indices = _resolve_qkv_sample_indices(
+            sample_indices=sample_indices,
+            sampling_features=sampling_features,
+            num_sample=num_sample,
+            sampling_strategy=sampling_strategy,
+            guarantee_mask=guarantee_mask,
+            exclude_mask=exclude_mask,
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
+        )
 
         if sample_indices is None:
             self.last_sample_indices = None
@@ -294,6 +370,9 @@ class CLIPEncoderFNA(CLIPEncoder):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
     ) -> BaseModelOutput:
+        # Always resample per batch by clearing cached indices
+        self.fna_cache.pop("sample_indices", None)
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -305,6 +384,11 @@ class CLIPEncoderFNA(CLIPEncoder):
         hidden_states = inputs_embeds
         sample_indices = None
         mask_dict = self.fna_cache.get("mask_dict", {})
+        fna_layers = self.fna_config["fna_layers"]
+        sampling_features = self.fna_config["sampling_features"]
+        sampling_strategy = self.fna_config["sampling_strategy"]
+        num_sample = self.fna_config["num_sample"]
+        resample_every_layer = self.fna_config["resample_every_layer"]
         for idx, encoder_layer in enumerate(self.layers):
             layer_args = {
                 "hidden_states": hidden_states,
@@ -312,25 +396,22 @@ class CLIPEncoderFNA(CLIPEncoder):
                 "causal_attention_mask": causal_attention_mask,
                 "output_attentions": output_attentions
             }
-            if idx in self.fna_config['fna_layers']:
-                sampling_features = self.fna_config["sampling_features"]
-                if not self.fna_config["resample_every_layer"] and sampling_features in {"q", "k", "v"}:
-                    sample_indices = self.fna_cache.get("sample_indices")
-                if self.fna_config['resample_every_layer'] or sample_indices is None:
-                    if sampling_features == "input":
-                        sampling_source = hidden_states
-                        sample_indices = sample_landmarks(
-                            sampling_source,
-                            self.fna_config['num_sample'], 
-                            sample_method=self.fna_config['sampling_strategy'],
-                            guarantee_mask=mask_dict.get("guarantee"),
-                            exclude_mask=mask_dict.get("exclude"),
-                        )
+            if idx in fna_layers:
+                sample_indices = _resolve_layer_sample_indices(
+                    sampling_features=sampling_features,
+                    resample_every_layer=resample_every_layer,
+                    sample_indices=sample_indices,
+                    fna_cache=self.fna_cache,
+                    hidden_states=hidden_states,
+                    num_sample=num_sample,
+                    sampling_strategy=sampling_strategy,
+                    mask_dict=mask_dict,
+                )
                 layer_args["use_fna"] = True
                 layer_args["sample_indices"] = sample_indices
                 layer_args["sampling_features"] = sampling_features
-                layer_args["sampling_strategy"] = self.fna_config["sampling_strategy"]
-                layer_args["num_sample"] = self.fna_config["num_sample"]
+                layer_args["sampling_strategy"] = sampling_strategy
+                layer_args["num_sample"] = num_sample
                 layer_args["guarantee_mask"] = mask_dict.get("guarantee")
                 layer_args["exclude_mask"] = mask_dict.get("exclude")
 
@@ -346,14 +427,14 @@ class CLIPEncoderFNA(CLIPEncoder):
 
             hidden_states = layer_outputs[0]
 
-            if (
-                idx in self.fna_config['fna_layers']
-                and not self.fna_config["resample_every_layer"]
-                and self.fna_config["sampling_features"] in {"q", "k", "v"}
-            ):
-                sample_indices = getattr(encoder_layer.self_attn, "last_sample_indices", sample_indices)
-                if sample_indices is not None:
-                    self.fna_cache["sample_indices"] = sample_indices
+            if idx in fna_layers:
+                sample_indices = _update_cached_sample_indices(
+                    sampling_features=sampling_features,
+                    resample_every_layer=resample_every_layer,
+                    fna_cache=self.fna_cache,
+                    attention_module=encoder_layer.self_attn,
+                    sample_indices=sample_indices,
+                )
 
             if output_attentions:
                 all_attentions = all_attentions + (layer_outputs[1],)
@@ -481,22 +562,17 @@ class LlamaFastNystromAttention(LlamaAttention):
         if kwargs.get("output_attentions", False):
             raise NotImplementedError("Output attentions are not implemented for FastNystromAttention.")
 
-        if sample_indices is None and sampling_features in {"q", "k", "v"}:
-            if num_sample is None:
-                raise ValueError("num_sample must be provided when sampling_features is q/k/v.")
-            source_map = {
-                "q": query_states,
-                "k": key_states,
-                "v": value_states,
-            }
-            sampling_source = source_map[sampling_features].mean(dim=1)
-            sample_indices = sample_landmarks(
-                sampling_source,
-                num_sample,
-                sample_method=sampling_strategy or "fps",
-                guarantee_mask=guarantee_mask,
-                exclude_mask=exclude_mask,
-            )
+        sample_indices = _resolve_qkv_sample_indices(
+            sample_indices=sample_indices,
+            sampling_features=sampling_features,
+            num_sample=num_sample,
+            sampling_strategy=sampling_strategy,
+            guarantee_mask=guarantee_mask,
+            exclude_mask=exclude_mask,
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
+        )
 
         if sample_indices is None:
             self.last_sample_indices = None
@@ -653,6 +729,9 @@ class LlamaModelFNA(LlamaModel):
         n_image_tokens: Optional[torch.Tensor] = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> BaseModelOutputWithPast:
+        # Always resample per batch by clearing cached indices
+        self.fna_cache.pop("sample_indices", None)
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -702,6 +781,11 @@ class LlamaModelFNA(LlamaModel):
 
         sample_indices = None
         mask_dict = self.fna_cache.get("mask_dict", {})
+        fna_layers = self.fna_config["fna_layers"]
+        sampling_features = self.fna_config["sampling_features"]
+        sampling_strategy = self.fna_config["sampling_strategy"]
+        num_sample = self.fna_config["num_sample"]
+        resample_every_layer = self.fna_config["resample_every_layer"]
         for layer_idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -717,25 +801,22 @@ class LlamaModelFNA(LlamaModel):
                 "position_embeddings": position_embeddings,
             }
             
-            if has_image_tokens and layer_idx in self.fna_config['fna_layers']:
-                sampling_features = self.fna_config["sampling_features"]
-                if not self.fna_config["resample_every_layer"] and sampling_features in {"q", "k", "v"}:
-                    sample_indices = self.fna_cache.get("sample_indices")
-                if self.fna_config['resample_every_layer'] or sample_indices is None:
-                    if sampling_features == "input":
-                        sampling_source = hidden_states
-                        sample_indices = sample_landmarks(
-                            sampling_source,
-                            self.fna_config['num_sample'], 
-                            sample_method=self.fna_config['sampling_strategy'],
-                            guarantee_mask=mask_dict.get("guarantee"),
-                            exclude_mask=mask_dict.get("exclude"),
-                        )
+            if has_image_tokens and layer_idx in fna_layers:
+                sample_indices = _resolve_layer_sample_indices(
+                    sampling_features=sampling_features,
+                    resample_every_layer=resample_every_layer,
+                    sample_indices=sample_indices,
+                    fna_cache=self.fna_cache,
+                    hidden_states=hidden_states,
+                    num_sample=num_sample,
+                    sampling_strategy=sampling_strategy,
+                    mask_dict=mask_dict,
+                )
                 layer_args["use_fna"] = True
                 layer_args["sample_indices"] = sample_indices
                 layer_args["sampling_features"] = sampling_features
-                layer_args["sampling_strategy"] = self.fna_config["sampling_strategy"]
-                layer_args["num_sample"] = self.fna_config["num_sample"]
+                layer_args["sampling_strategy"] = sampling_strategy
+                layer_args["num_sample"] = num_sample
                 layer_args["guarantee_mask"] = mask_dict.get("guarantee")
                 layer_args["exclude_mask"] = mask_dict.get("exclude")
 
@@ -749,15 +830,14 @@ class LlamaModelFNA(LlamaModel):
 
             hidden_states = layer_outputs[0]
 
-            if (
-                has_image_tokens
-                and layer_idx in self.fna_config['fna_layers']
-                and not self.fna_config["resample_every_layer"]
-                and self.fna_config["sampling_features"] in {"q", "k", "v"}
-            ):
-                sample_indices = getattr(decoder_layer.self_attn, "last_sample_indices", sample_indices)
-                if sample_indices is not None:
-                    self.fna_cache["sample_indices"] = sample_indices
+            if has_image_tokens and layer_idx in fna_layers:
+                sample_indices = _update_cached_sample_indices(
+                    sampling_features=sampling_features,
+                    resample_every_layer=resample_every_layer,
+                    fna_cache=self.fna_cache,
+                    attention_module=decoder_layer.self_attn,
+                    sample_indices=sample_indices,
+                )
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
@@ -863,21 +943,30 @@ class LlavaNextForConditionalGenerationFNA(LlavaNextForConditionalGeneration, FN
             special_image_mask = (input_ids == self.config.image_token_index).unsqueeze(-1)
             special_image_mask = special_image_mask.expand_as(inputs_embeds).to(inputs_embeds.device)
             if not is_torchdynamo_compiling() and inputs_embeds[special_image_mask].numel() != image_features.numel():
-                n_image_tokens = (input_ids == self.config.image_token_index).sum()
-                n_image_features = image_features.shape[0]
-                raise ValueError(
-                    f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
-                )
+                n_image_tokens = int((input_ids == self.config.image_token_index).sum().item())
+                n_image_features = int(image_features.shape[0])
+                if getattr(self, "_visionzip_truncate_features", False) and n_image_features > n_image_tokens:
+                    logging.warning(
+                        "VisionZip: truncating image features from %d to %d to match image tokens.",
+                        n_image_features,
+                        n_image_tokens,
+                    )
+                    image_features = image_features[:n_image_tokens]
+                else:
+                    raise ValueError(
+                        "Image features and image tokens do not match: "
+                        f"tokens: {n_image_tokens}, features {n_image_features}"
+                    )
             image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
 
             has_image_tokens = True
             n_image_tokens = special_image_mask[:, :, 0].sum(dim=1)
             # TODO: This seems to hurt performance, why?
-            # self.fna_cache["mask_dict"] = {
-            #     "guarantee": ~special_image_mask[:, :, 0].bool(), # Guarantee mask for non-image tokens
-            #     "exclude": None,
-            # }
+            self.fna_cache["mask_dict"] = {
+                "guarantee": ~special_image_mask[:, :, 0].bool(), # Guarantee mask for non-image tokens
+                "exclude": None,
+            }
         else:
             has_image_tokens = False
             n_image_tokens = None

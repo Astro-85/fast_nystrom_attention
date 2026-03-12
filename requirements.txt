@@ -1,0 +1,36 @@
+# Core deps for Fast Nyström Attention (FNA)
+# NOTE: torch / torchvision and torch-quickfps are CUDA-dependent — install them first
+
+accelerate>=1.12,<2
+einops>=0.8,<1
+fsspec>=2024.10,<2027
+
+huggingface-hub>=0.25,<1
+hf-xet>=1.0,<2
+
+numpy>=2.0,<3
+pillow>=10,<13
+tqdm>=4.66,<5
+requests>=2.31,<3
+packaging>=23.2
+
+# HF stack
+transformers==4.51.3
+safetensors>=0.4,<1
+sentencepiece>=0.2,<1
+protobuf>=3.20,<7
+regex>=2023.12.25
+
+# If you use COCO/VQA scripts you may want these (kept as hard deps because they're small/common)
+pyyaml>=6,<7
+
+# Optional dev / notebook deps (NOT required for running the library)
+jupyterlab>=4.2,<5
+ipykernel>=6.29,<8
+ipywidgets>=8.1,<9
+
+matplotlib>=3.8,<4
+pandas>=2.2,<4
+
+# HTML / parsing utilities occasionally used in notebooks
+beautifulsoup4>=4.12,<5
