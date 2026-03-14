@@ -5,6 +5,7 @@ This script loads a Llava-Next checkpoint and fine-tunes it on the ScienceQA dat
 from PIL import Image
 import torch
 from torch.utils.data import DataLoader
+from torch.utils.checkpoint import checkpoint_sequential
 from torch.optim import AdamW
 import logging
 from functools import partial
@@ -13,6 +14,8 @@ from pathlib import Path
 from typing import Callable, Dict, List, MutableMapping, Optional, Sequence, Tuple
 from datasets import load_dataset, Dataset
 from tqdm import tqdm
+import math
+from peft import LoraConfig, get_peft_model
 
 import random
 
@@ -24,6 +27,29 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from fast_nystrom_attention import LlavaNextForConditionalGenerationFNA
 from transformers import LlavaNextProcessor
+
+def print_lora_candidates(model):
+    for name, module in model.named_modules():
+        if any(x in name for x in ["q_proj", "k_proj", "v_proj", "o_proj"]):
+            print(name, module)
+
+
+def freeze_module(module: torch.nn.Module) -> None:
+    for param in module.parameters():
+        param.requires_grad = False
+
+
+def apply_lora(model, args):
+    lora_config = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=0.05,
+        bias="none",
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+    )
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
+    return model
 
 
 def load_scienceqa_dataset(args: argparse.Namespace, split: str = "train") -> Dataset:
@@ -115,7 +141,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fna-resample-every-layer", action="store_true", help="Resample landmarks before each FNA layer")
     parser.add_argument(
         "--fna-sampling-strategy",
-        default="fps",
+        default="random",
         choices=["fps", "random"],
         help="Sampling strategy used to select landmarks",
     )
@@ -135,6 +161,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
+    parser.add_argument("--grad-checkpointing", action="store_true")
     parser.add_argument("--save-every", type=int, default=200)
     parser.add_argument("--max-length", type=int, default=1024)
 
@@ -220,7 +247,10 @@ def collate_fn(batch: List[DataRow], args: argparse.Namespace, processor: LlavaN
 
     TARGET = 336
 
-    images = [(img if img is not None else Image.new("RGB", (336,336), (0,0,0))) for img in images]
+    images = [
+        (img.resize((TARGET, TARGET)) if img is not None else Image.new("RGB", (TARGET, TARGET)))
+        for img in images
+    ]
 
     ground_truths = [row.ground_truth for row in batch]
 
@@ -232,6 +262,7 @@ def collate_fn(batch: List[DataRow], args: argparse.Namespace, processor: LlavaN
         return_tensors="pt",
         padding=True,
         truncation=True,
+#       max_length=args.max_length,
     )
 
     labels = inputs["input_ids"].clone()
@@ -243,7 +274,7 @@ def collate_fn(batch: List[DataRow], args: argparse.Namespace, processor: LlavaN
             return_tensors="pt",
             add_special_tokens=False,  
             truncation=True,
-            max_length=args.max_length,
+ #          max_length=args.max_length,
         )["input_ids"][0]
 
         prompt_len = len(prompt_ids)
@@ -272,12 +303,27 @@ def save_hf_checkpoint(
     
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
     args = parse_args()
 
     set_seed(args.seed)
 
     dtype = dtype_from_string(args.dtype)
     model, processor = load_model_and_processor(args, dtype)
+
+    if args.use_lora:
+        #print_lora_candidates(model)
+        if hasattr(model, "vision_tower"):
+            freeze_module(model.vision_tower)
+        if hasattr(model, "multi_modal_projector"):
+            freeze_module(model.multi_modal_projector)
+        if hasattr(model, "lm_head"):
+            freeze_module(model.lm_head)
+        model = apply_lora(model, args)
+
 
     train_ds = load_scienceqa_dataset(args, "train")
     test_ds = load_scienceqa_dataset(args, "validation")
@@ -307,7 +353,14 @@ def main() -> None:
 
     
     model.train()
-    optim = AdamW(model.parameters(), lr=args.lr)
+    if args.grad_checkpointing:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        model.config.use_cache = False
+
+    trainable_params = [param for param in model.parameters() if param.requires_grad]
+    optim = AdamW(trainable_params, lr=args.lr)
     device = torch.device(args.device)
     optim.zero_grad(set_to_none=True)
 

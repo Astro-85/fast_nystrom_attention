@@ -41,6 +41,42 @@ if str(PROJECT_ROOT) not in sys.path:
 from fast_nystrom_attention import LlavaNextForConditionalGenerationFNA
 from transformers import LlavaNextProcessor
 
+from transformers import LogitsProcessor
+import torch
+import string
+from typing import List, Set
+
+@dataclass
+class GenerationRecord:
+    question_id: str
+    question: str
+    answer_choices: List[str]
+    ground_truth_answer: str
+    predicted_answer: str
+    full_generation: str
+    generation_latency_s: Optional[float] = None
+
+    def to_json(self) -> Dict[str, object]:
+        return asdict(self)
+
+
+@dataclass
+class ScienceQAMetrics:
+    total_questions: int
+    correct_answers: int
+    accuracy: float
+    average_latency_s: Optional[float] = None
+    median_latency_s: Optional[float] = None
+
+    def to_json(self) -> Dict[str, object]:
+        return asdict(self)
+
+
+def set_random_seed(seed: int) -> None:
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description = "TextVQA Evaluation for Llava + Fast Nyström Attention (FNA)"
@@ -49,6 +85,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_textvqa_eval(args: argparse.Namespace):
+    set_random_seed(args.seed)
+    
 
 
 def main():

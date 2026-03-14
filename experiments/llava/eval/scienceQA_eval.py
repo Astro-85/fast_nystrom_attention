@@ -42,6 +42,11 @@ if str(PROJECT_ROOT) not in sys.path:
 from fast_nystrom_attention import LlavaNextForConditionalGenerationFNA
 from transformers import LlavaNextProcessor
 
+from transformers import LogitsProcessor
+import torch
+import string
+from typing import List, Set
+
 
 @dataclass
 class GenerationRecord:
@@ -67,12 +72,6 @@ class ScienceQAMetrics:
 
     def to_json(self) -> Dict[str, object]:
         return asdict(self)
-
-
-from transformers import LogitsProcessor
-import torch
-import string
-from typing import List, Set
 
 
 def normalize_text(text: str) -> str:
