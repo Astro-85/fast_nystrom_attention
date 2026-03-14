@@ -74,7 +74,10 @@ class DataRow():
 
 
         conversation = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "system", 
+                "content": [{"type": "text", "text": SYSTEM_PROMPT}],
+            },
             {
                 "role": "user", 
                 "content": [
@@ -189,9 +192,12 @@ def collate_fn(batch: List[DataRow], args: argparse.Namespace, processor: LlavaN
     prompts = [row.prompt for row in batch]
     images = [row.image for row in batch]
 
-
-    images = [(img if img is not None else Image.new("RGB", (336,336), (0,0,0))) for img in images]
-
+    TARGET = 336
+    images = [
+        img.resize((TARGET, TARGET)) if img is not None
+        else Image.new("RGB", (TARGET, TARGET), (0, 0, 0))
+        for img in images
+    ]
     ground_truths = [row.gt for row in batch]
 
     full_prompts = [f"{prompt} {ground_truth}" for prompt, ground_truth in zip(prompts, ground_truths)]
@@ -201,8 +207,7 @@ def collate_fn(batch: List[DataRow], args: argparse.Namespace, processor: LlavaN
         images=images,
         return_tensors="pt",
         padding=True,
-        truncation=True,
-        max_length=args.max_length,
+        truncation=False,
     )
 
     labels = inputs["input_ids"].clone()
@@ -213,8 +218,7 @@ def collate_fn(batch: List[DataRow], args: argparse.Namespace, processor: LlavaN
             prompt,
             return_tensors="pt",
             add_special_tokens=False,  
-            truncation=True,
-            max_length=args.max_length,
+            truncation=False,
         )["input_ids"][0]
 
         prompt_len = len(prompt_ids)
@@ -374,7 +378,7 @@ def main():
 
     model.eval()
     total_loss = 0.0
-    num_batches = 0.0
+    num_batches = 0
 
     batch_bar = tqdm(enumerate(test_loader), desc="Evaluating", leave=False)
     for i, batch in batch_bar:
