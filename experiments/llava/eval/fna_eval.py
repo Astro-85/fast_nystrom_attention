@@ -23,6 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from coco_vqa_eval import run_coco_eval
 from scienceQA_eval import run_scienceqa_eval
+from textVQA_eval import run_textvqa_eval
 
 
 
@@ -122,7 +123,16 @@ def parse_args() -> argparse.Namespace:
         help="HF dataset name to auto-download via datasets.load_dataset",
     )
 
-    
+    txtvqa = parser.add_argument_group("TextVQA Evaluation Arguments")
+    txtvqa.add_argument("--textvqa-split", default="validation")
+    txtvqa.add_argument("--textvqa-cache-dir", type=Path, default=None)
+    txtvqa.add_argument("--textvqa-images-root", type=Path, default=None, help="Images root (local JSON mode only)")
+    txtvqa.add_argument(
+         "--textvqa-hf-dataset",
+        default="lmms-lab/textvqa",
+        help="HF dataset name to auto-download via datasets.load_dataset",
+    )
+
     return parser.parse_args()
 
 
@@ -143,7 +153,8 @@ def main() -> None:
         run_coco_eval(args)
 
     elif benchmark == "textvqa":
-        raise NotImplementedError("TextVQA evaluation not yet implemented.")
+        run_textvqa_eval(args)
+
     elif benchmark == "qk-vqa":
         raise NotImplementedError("QK-VQA evaluation not yet implemented.")
     elif benchmark == "scienceqa":

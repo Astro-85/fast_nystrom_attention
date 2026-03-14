@@ -168,7 +168,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--textvqa-hf-dataset",
-        default="lmms-lab/ScienceQA-IMG",
+        default="lmms-lab/textvqa",
         help="HF dataset name to auto-download via datasets.load_dataset",
     )
 
