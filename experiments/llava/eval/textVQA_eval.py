@@ -50,7 +50,6 @@ from typing import List, Set
 class GenerationRecord:
     question_id: str
     question: str
-    answer_choices: List[str]
     ground_truth_answer: str
     predicted_answer: str
     full_generation: str
@@ -61,7 +60,7 @@ class GenerationRecord:
 
 
 @dataclass
-class ScienceQAMetrics:
+class TextVQAMetrics:
     total_questions: int
     correct_answers: int
     accuracy: float
@@ -70,6 +69,26 @@ class ScienceQAMetrics:
 
     def to_json(self) -> Dict[str, object]:
         return asdict(self)
+
+def move_batch_to_device(batch: MutableMapping[str, torch.Tensor], device: Optional[str], dtype: torch.dtype) -> MutableMapping[str, torch.Tensor]:
+    if device is None:
+        return batch
+    for key, value in list(batch.items()):
+        if torch.is_tensor(value):
+            batch[key] = value.to(device=device)
+            if value.dtype in {torch.float32, torch.float16, torch.bfloat16}:
+                batch[key] = batch[key].to(dtype)
+    return batch
+
+
+def write_record(path: Path, record: GenerationRecord) -> None:
+    with path.open("a") as fp:
+        fp.write(json.dumps(record.to_json()) + "\n")
+
+
+def maybe_empty_cuda_cache() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def set_random_seed(seed: int) -> None:
@@ -193,7 +212,7 @@ def load_textvqa_dataset(args: argparse.Namespace) -> Dataset:
     return load_dataset(
         args.textvqa_hf_dataset,
         split=args.textvqa_split,
-        cache_dir=str(args.textvqa_cache_dir) if args.textvqa_cache_dir else None,,
+        cache_dir=str(args.textvqa_cache_dir) if args.textvqa_cache_dir else None,
     )
 
 def read_existing_predictions(path: Path) -> List[GenerationRecord]:
@@ -209,6 +228,104 @@ def read_existing_predictions(path: Path) -> List[GenerationRecord]:
             records.append(GenerationRecord(**payload))
     logging.info("Resuming from %d existing predictions", len(records))
     return records
+
+def prepare_prompt(
+    processor: LlavaNextProcessor,
+    question: str,
+    has_image: bool,
+    ocr_tokens: Optional[List[str]]=None,
+) -> str:
+    SYSTEM_PROMPT = """
+    You are answering a visual question based on an image.
+
+    Your task is to read the image carefully and provide the correct answer.
+
+    Rules:
+    - The answer must be short and concise.
+    - Output only the final answer.
+    - Do not include any explanation.
+    - Do not include additional text or formatting.
+    """
+
+    conversation = []
+    conversation.append({
+        "role": "system",
+        "content": {
+            "type": "text",
+            "text": SYSTEM_PROMPT,
+        }
+    })
+
+    content = []
+    if has_image:
+        content.append({
+            "type": "image",
+        })
+
+    content.append({
+        "type": "text",
+        "text": question,
+    })
+
+    if ocr_tokens:
+        cleaned_tokens = [token.strip().lower() for token in ocr_tokens if token.strip()]
+        if cleaned_tokens:
+            token_text = ", ".join(cleaned_tokens)
+            content.append({
+                "type": "text",
+                "text": f"Visible text detected in the image (OCR tokens): {token_text}",
+            })
+
+    conversation.append({
+        "role": "user",
+        "content": content
+    })
+
+    return processor.apply_chat_template(conversation, apply_generation_prompt=True)
+
+
+def retrieve_answer(choices: List[str]) -> str:
+    choices = [c.strip().lower() for c in choices if c.strip()]
+    if not choices:
+        raise ValueError("No valid answer choices found in generation")
+
+    counts = Counter(choices)
+    currCount = -1
+    answer = None
+    for choice, count in counts.items():
+        if count > currCount:
+            answer = choice
+            currCount = count
+
+    return answer
+
+
+def generate_answer_textvqa(
+    model: LlavaNextForConditionalGenerationFNA,
+    processor: LlavaNextProcessor,
+    sample: Dict[str, object],
+    args: argparse.Namespace,
+    torch_dtype: torch.dtype,
+    sample_index: int,
+) -> GenerationRecord:
+    question_text = str(sample.get("question", None))
+    answer = retrieve_answer(sample.get("answers", None))
+    question_id = int(sample.get("question_id", sample_index))
+
+    image_obj = sample.get("image", None)
+    has_image = image_obj is not None
+    ocr_tokens = sample.get("ocr_tokens", None)
+
+    if has_image:
+        image = image_obj.convert("RGB")
+        prompt = prepare_prompt(processor, question_text, has_image=True, ocr_tokens=ocr_tokens if ocr_tokens else None)
+        inputs = processor(images=image, text=prompt, return_tensors="pt")
+    else:
+        prompt = prepare_prompt(processor, question_text, has_image=False, ocr_tokens=ocr_tokens if ocr_tokens else None)
+        inputs = processor(text=prompt, return_tensors="pt")
+
+    inputs = move_batch_to_device(inputs, args.device, torch_dtype)
+
 
 def run_textvqa_eval(args: argparse.Namespace):
     dtype = dtype_from_string(args.dtype)
@@ -231,6 +348,17 @@ def run_textvqa_eval(args: argparse.Namespace):
         idx = str(row.get("question_id", i))
         if idx in known_ids:
             continue
+
+        record = generate_answer_textvqa(model, processor, row, args, dtype, i)
+        write_record(predictions_path, record)
+        predictions.append(record)
+        known_ids.add(idx)
+        maybe_empty_cuda_cache()
+
+    latencies = [rec.generation_latency_s for rec in predictions if rec.generation_latency_s is not None]
+    avg_latency = float(sum(latencies) / len(latencies)) if latencies else None
+    median_latency = float(statistics.median(latencies)) if latencies else None
+
 
 
 
