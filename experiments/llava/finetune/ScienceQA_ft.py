@@ -302,7 +302,7 @@ def save_hf_checkpoint(
 
     
 
-def write_loss(Path: PATH, loss: float) -> None:
+def write_loss(Path: str, loss: float) -> None:
     with Path.open("a") as fp:
         fp.write(f"final loss: {loss}\n")
 
