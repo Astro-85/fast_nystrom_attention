@@ -302,6 +302,10 @@ def save_hf_checkpoint(
 
     
 
+def write_loss(Path: PATH, loss: float) -> None:
+    with Path.open("a") as fp:
+        fp.write(f"final loss: {loss}\n")
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -401,6 +405,8 @@ def main() -> None:
     model.eval()
     total_loss = 0.0
     num_batches = 0
+
+    eval_dir = args.output_dir / "eval.txt"
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Evaluating batches", unit="batch"):
             batch = {k: v.to(device) for k, v in batch.items()}
@@ -412,6 +418,7 @@ def main() -> None:
 
 
     avg_loss = float(total_loss/num_batches) if num_batches > 0 else 0.0
+    write_loss(eval_dir, avg_loss)
     logging.info("Evaluation complete. Average loss: %.4f", avg_loss)
             
 
