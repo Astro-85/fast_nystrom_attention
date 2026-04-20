@@ -14,6 +14,7 @@ def normalize_pruning_config(config: Dict) -> Dict:
     confg.setdefault("pruning_mlp_ratio", 4.0)
     confg.setdefault("pruning_dropout", 0.0)
     confg.setdefault("codebook_size", 1024)
+    confg.setdefault("commitment_loss_weight", 0.25)
     return confg
 
 
@@ -67,7 +68,16 @@ class LlavaNextCompressor(nn.Module):
         distances = torch.cdist(flattened, self.codebook.weight)
         indices = torch.argmin(distances, dim=1)
         quantized = self.codebook(indices).view(B, self.K, self.D)
-        return quantized
+        quantized_st = latents + (quantized - latents).detach()
+
+        beta = self.config["commitment_loss_weight"]
+
+        codebook_loss = ((quantized - latents.detach())**2).mean()
+        commitment_loss = ((latents - quantized.detach())**2).mean()
+        vq_loss = codebook_loss + beta * commitment_loss
+
+
+        return quantized_st, vq_loss
 
         
 

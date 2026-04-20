@@ -6,8 +6,10 @@ import warnings
 
 import torch
 import torch.nn as nn
+from torch.nn.utils.rnn import pad_sequence
 
 from .attention import sample_landmarks, fast_nystrom_attention
+from token_pruning import LlavaNextCompressor
 
 
 def copy_non_module_attributes(source: nn.Module, destination: nn.Module):
@@ -861,12 +863,14 @@ class LlavaNextForConditionalGenerationFNA(LlavaNextForConditionalGeneration, FN
         self, 
         config: LlavaNextConfig, 
         fna_config: Optional[Dict[str, Any]] = {}, 
-        fna_cache: Optional[Dict[str, Any]] = {}
+        fna_cache: Optional[Dict[str, Any]] = {},
+        pruning_config: Optional[Dict[str, Any]] = {},
     ):
         super().__init__(config)
         normalized_config = normalize_fna_config(fna_config)
         self.fna_config = normalized_config
         self.fna_cache = fna_cache
+        self.pruning_config = pruning_config
 
         # Replace LlamaModel with LlamaModelFNA
         self.language_model.model = LlamaModelFNA.from_llama_model(
@@ -875,6 +879,8 @@ class LlavaNextForConditionalGenerationFNA(LlavaNextForConditionalGeneration, FN
             normalized_config, 
             fna_cache
         )
+
+        self.image_compressor = LlavaNextCompressor(pruning_config) 
 
     def forward(
         self,
@@ -931,6 +937,61 @@ class LlavaNextForConditionalGenerationFNA(LlavaNextForConditionalGeneration, FN
                 vision_feature_layer=vision_feature_layer,
                 vision_feature_select_strategy=vision_feature_select_strategy,
             )
+
+            if self.pruning_config.get("enable_pruning", False):
+                K = self.pruning_config["pruning_num_latents"]
+                if K is None:
+                    K = 32
+                image_features, vq_loss = self.image_compressor(image_features)
+                if image_features.shape[1] != K:
+                    raise ValueError("Compressor Output does not match the expected number of latents: got %d, expected %d." % (image_features.shape[1], K))
+
+                new_ids = []
+                new_labels = [] if labels is not None else None
+                new_attention_mask = [] if attention_mask is not None else None
+                for b in range(input_ids.shape[0]):
+                    count = 0
+                    keep_mask = []
+                    for input_id in input_ids[b]:
+                        if input_id.item() == self.config.image_token_index:
+                            keep_mask.append(count < K)
+                            count +=1
+                        else:
+                            keep_mask.append(True)
+
+                    new_ids.append(input_ids[b][keep_mask])
+                    if labels is not None:
+                        new_labels.append(labels[b][keep_mask])
+                    if attention_mask is not None:  
+                        new_attention_mask.append(attention_mask[b][keep_mask])
+
+                pad_token_id = self.pad_token_id
+                if pad_token_id is None:
+                    pad_token_id = self.config.pad_token_id
+                if pad_token_id is None:
+                    pad_token_id = 0
+
+
+                input_ids = pad_sequence(new_ids, batch_first=True, padding_value=pad_token_id)
+                labels = pad_sequence(new_labels, batch_first=True, padding_value=-100) if new_labels is not None else None
+                attention_mask = pad_sequence(new_attention_mask, batch_first=True, padding_value=0) if new_attention_mask is not None else None
+
+
+                if position_ids is not None:
+                    if attention_mask is not None:
+                        position_ids = attention_mask.long().cumsum(-1) - 1
+                        position_ids.masked_fill_(attention_mask == 0, 0)
+                    else:
+                        position_ids = torch.arange(
+                            input_ids.shape[1], device=input_ids.device
+                        ).unsqueeze(0).expand(input_ids.shape[0], -1)
+
+                inputs_embeds = self.get_input_embeddings()(input_ids)
+
+
+
+                
+
 
             # NOTE we only support multimodal_patch_merge_type == "spatial_unpad"
             image_features, feature_lens = self.pack_image_features(
