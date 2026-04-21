@@ -69,32 +69,42 @@ def set_seed(seed: int) -> None:
 SYSTEM_PROMPT = """
 You are taking a multiple-choice exam.
 
-Your task is to choose the correct option.
+Your task is to choose the correct option and provide the reasoning behind your choice.
 
-Rules:
-- Output the correct answer, chosen from the answer options
-- No explanation is needed, just the answer itself
-- The answer should be exactly one of the options, without any additional text or formatting
-    """
+Use the image if one is provided.
+Use the hint if one is provided.
+
+Output format:
+Reasoning: <your reasoning>
+Answer: <exact answer choice text>
+"""
 
 
 """DataRow is a helper class to convert a raw data row from the ScienceQA dataset into the format expected by the LlavaNext processor."""
 class DataRow:
     def __init__(self, data_row: dict, processor: LlavaNextProcessor):
         self.image = self.__retrieve_image(data_row)
+        self.has_image = self.image is not None
         self.ground_truth = self.__get_ground_truth(data_row)
+        self.hint = self.__retrieve_hint(data_row)
         self.prompt = self.__prepare_prompt(data_row, processor)
 
     def __retrieve_image(self, data_row: dict) -> Image.Image | None:
         image = data_row.get("image", None)
         return image.convert("RGB") if image is not None else None
 
+    def __retrieve_hint(self, data_row: dict) -> str:
+        hint = data_row.get("hint", None)
+        return hint if hint is not None else ""
+
     def __get_ground_truth(self, data_row: dict) -> str | None:
         answer = data_row.get("answer", None)
         choices = data_row.get("choices", None)
         if answer is None or choices is None:
             raise ValueError("Data row is missing 'answer' or 'choices' field")
-        return choices[answer]
+        reasoning = data_row.get("solution", "").strip()
+        fin_ans = f"{reasoning}\nAnswer: {choices[answer]}" if reasoning else f"Answer: {choices[answer]}"
+        return fin_ans
 
     def __prepare_prompt(self, data_row: dict, processor: LlavaNextProcessor) -> str | None:
         question = data_row.get("question", None)
@@ -103,7 +113,16 @@ class DataRow:
             raise ValueError("Data row is missing 'question' field")
 
         choices_text = "\n".join([f"{chr(65+i)}. {c}" for i, c in enumerate(choices)])
-        
+
+        content = []
+        if self.has_image:
+            content.append({"type": "image"})
+        content.append({"type": "text", "text": question})
+        if self.hint:
+            content.append({"type": "text", "text": f'Hint: {self.hint}'})
+        content.append({"type": "text", "text": "Choices:\n" + choices_text})
+        content.append({"type": "text", "text": "Reasoning: "})
+
 
         conversation = [
             {
@@ -112,12 +131,7 @@ class DataRow:
             },
             {
                 "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": question},
-                    {"type": "text", "text": "Choices:\n" + choices_text},
-                    {"type": "text", "text": "Answer:"},
-                ],
+                "content": content,
             },
         ]
 
@@ -148,7 +162,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--scienceqa-hf-dataset",
-        default="lmms-lab/ScienceQA-IMG",
+        default="derek-thomas/ScienceQA",
         help="HF dataset name to auto-download via datasets.load_dataset",
     )
     parser.add_argument("--disable-fna", action="store_true")
@@ -245,25 +259,38 @@ def collate_fn(batch: List[DataRow], args: argparse.Namespace, processor: LlavaN
     prompts = [row.prompt for row in batch]
     images = [row.image for row in batch]
 
-    TARGET = 336
-
-    images = [
-        (img.resize((TARGET, TARGET)) if img is not None else Image.new("RGB", (TARGET, TARGET)))
-        for img in images
-    ]
-
     ground_truths = [row.ground_truth for row in batch]
 
     full_prompts = [f"{prompt} {ground_truth}" for prompt, ground_truth in zip(prompts, ground_truths)]
 
-    inputs = processor(
-        text=full_prompts,
-        images=images,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-#       max_length=args.max_length,
-    )
+    has_images = [img is not None for img in images]
+    if all(has_images):
+        TARGET = 336
+        images = [
+            img.resize((TARGET, TARGET)) for img in images
+        ]
+        inputs = processor(
+            text=full_prompts,
+            images=images,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+    #       max_length=args.max_length,
+        )
+
+    elif not any(has_images):
+        inputs = processor(
+            text=full_prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+    #       max_length=args.max_length,
+        )
+
+    else:
+        raise ValueError("Mixed presence of images in batch is not supported (all or none must have images)")
+
+    
 
     labels = inputs["input_ids"].clone()
     tok = processor.tokenizer
@@ -320,10 +347,11 @@ def main() -> None:
     dtype = dtype_from_string(args.dtype)
     model, processor = load_model_and_processor(args, dtype)
 
+    if hasattr(model, "vision_tower"):
+        freeze_module(model.vision_tower)
+
     if args.use_lora:
         #print_lora_candidates(model)
-        if hasattr(model, "vision_tower"):
-            freeze_module(model.vision_tower)
         if hasattr(model, "multi_modal_projector"):
             freeze_module(model.multi_modal_projector)
         if hasattr(model, "lm_head"):
@@ -342,20 +370,51 @@ def main() -> None:
     train_rows: List[DataRow] = [DataRow(row, processor) for row in train_ds]
     test_rows: List[DataRow] = [DataRow(row, processor) for row in test_ds]
 
+
+    train_rows_with_images = [row for row in train_rows if row.has_image]
+    train_rows_without_images = [row for row in train_rows if not row.has_image]
+    test_rows_with_images = [row for row in test_rows if row.has_image]
+    test_rows_without_images = [row for row in test_rows if not row.has_image]
+
     collate = partial(collate_fn, args=args, processor=processor)
 
-    train_loader = DataLoader(
-        train_rows, 
+    train_loader_with_images = DataLoader(
+        train_rows_with_images, 
         batch_size=args.batch_size, 
         shuffle=True, 
         collate_fn=collate
         )
-    test_loader = DataLoader(
-        test_rows, 
+    train_loader_without_images = DataLoader(
+        train_rows_without_images, 
+        batch_size=args.batch_size, 
+        shuffle=True, 
+        collate_fn=collate
+        )
+
+    test_loader_with_images = DataLoader(
+        test_rows_with_images, 
         batch_size=args.batch_size, 
         shuffle=False, 
         collate_fn=collate
         )
+    test_loader_without_images = DataLoader(
+        test_rows_without_images, 
+        batch_size=args.batch_size, 
+        shuffle=False, 
+        collate_fn=collate
+        )
+
+    train_loaders = [
+        ("with_images", train_loader_with_images), 
+        ("without_images", train_loader_without_images)
+    ]
+
+    test_loaders = [
+        ("with_images", test_loader_with_images), 
+        ("without_images", test_loader_without_images)
+    ]
+
+
 
     
     model.train()
@@ -374,33 +433,35 @@ def main() -> None:
 
     for epoch in tqdm(range(args.num_epochs), desc="Training epochs", unit="epoch"):
         logging.info("Starting epoch %d/%d", epoch + 1, args.num_epochs)
-        batch_bar = tqdm(enumerate(train_loader), desc="Training batches", unit="batch", leave=False)
 
-        i=-1
-        for i, batch in batch_bar:
-            batch = {k: v.to(device) for k, v in batch.items()}
-            outputs = model(**batch)
-            loss = outputs.loss/args.grad_accum_steps
-            loss.backward()
+        for loader_name, train_loader in [loader for loader in train_loaders if len(loader[1]) > 0]:
+            batch_bar = tqdm(enumerate(train_loader), desc=f'Training batches ({loader_name})', unit="batch", leave=False)
 
-            if (i + 1) % args.grad_accum_steps == 0:
+            i=-1
+            for i, batch in batch_bar:
+                batch = {k: v.to(device) for k, v in batch.items()}
+                outputs = model(**batch)
+                loss = outputs.loss/args.grad_accum_steps
+                loss.backward()
+
+                if (i + 1) % args.grad_accum_steps == 0:
+                    global_step += 1
+                    optim.step()
+                    optim.zero_grad(set_to_none=True)
+
+                    if global_step % args.save_every == 0:
+                        save_hf_checkpoint(model, processor, args.output_dir, step=global_step)
+
+                batch_bar.set_postfix(loss=f"{(loss.item() * args.grad_accum_steps):.4f}")
+
+            remainder = (i + 1) % args.grad_accum_steps
+            if remainder != 0:
                 global_step += 1
                 optim.step()
                 optim.zero_grad(set_to_none=True)
 
                 if global_step % args.save_every == 0:
                     save_hf_checkpoint(model, processor, args.output_dir, step=global_step)
-
-            batch_bar.set_postfix(loss=f"{(loss.item() * args.grad_accum_steps):.4f}")
-
-        remainder = (i + 1) % args.grad_accum_steps
-        if remainder != 0:
-            global_step += 1
-            optim.step()
-            optim.zero_grad(set_to_none=True)
-
-            if global_step % args.save_every == 0:
-                save_hf_checkpoint(model, processor, args.output_dir, step=global_step)
 
     save_hf_checkpoint(model, processor, args.output_dir, step=global_step)
 
@@ -409,13 +470,14 @@ def main() -> None:
     num_batches = 0
 
     with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Evaluating batches", unit="batch"):
-            batch = {k: v.to(device) for k, v in batch.items()}
-            outputs = model(**batch)
-            loss = outputs.loss
+        for loader_name, test_loader in [loader for loader in test_loaders if len(loader[1]) > 0]:
+            for batch in tqdm(test_loader, desc=f'Evaluating batches ({loader_name})', unit="batch"):
+                batch = {k: v.to(device) for k, v in batch.items()}
+                outputs = model(**batch)
+                loss = outputs.loss
 
-            total_loss += loss.item()
-            num_batches += 1
+                total_loss += loss.item()
+                num_batches += 1
 
 
     avg_loss = float(total_loss/num_batches) if num_batches > 0 else 0.0
