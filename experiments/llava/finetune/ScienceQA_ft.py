@@ -168,6 +168,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-fna", action="store_true")
     parser.add_argument("--scienceqa-cache-dir", type=Path, default=None)
 
+    parser.add_argument("--CLIP-feature-layer", type=int, default=-1, help="Which CLIP layer to take features from for FNA (counting from the end, -1 is the final layer)")
+
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32", "float64"])
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--device-map", default=None)
@@ -185,6 +187,8 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-eval-samples", type=int, default=None)
+
+
 
 
     return parser.parse_args()
@@ -346,6 +350,14 @@ def main() -> None:
 
     dtype = dtype_from_string(args.dtype)
     model, processor = load_model_and_processor(args, dtype)
+
+    CLIP_LAYER = args.CLIP_feature_layer
+    if hasattr(model.config, "vision_feature_layer"):
+        model.config.vision_feature_layer = CLIP_LAYER
+        logging.info("Set CLIP feature layer to %d", CLIP_LAYER)
+    if hasattr(model.config, "mm_vision_select_layer"):
+        model.config.mm_vision_select_layer = CLIP_LAYER
+        logging.info("Set CLIP feature layer to %d", CLIP_LAYER)
 
     if hasattr(model, "vision_tower"):
         freeze_module(model.vision_tower)

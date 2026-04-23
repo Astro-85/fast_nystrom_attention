@@ -299,15 +299,17 @@ def prepare_prompt(
     SYSTEM_PROMPT = """
     You are taking a multiple-choice exam.
 
-    Your task is to choose the correct option.
+    Your task is to choose the correct option and explain your reasoning.
 
     Rules:
-    - Output EXACTLY the text of the correct answer choice.
-    - Output ONLY the answer text.
-    - Do NOT explain your reasoning.
-    - Do NOT output anything else.
+    - Use the image if one is provided.
+    - Use the hint if one is provided.
+    - Reason step by step using the available information.
+    - Then provide the final correct answer choice text.
 
-    If you output anything other than a single answer choice, the answer is incorrect.
+    Output format:
+    Reasoning: <your reasoning>
+    Answer: <exact answer choice text>
     """
 
     conversation = []
