@@ -84,6 +84,20 @@ def normalize_text(text: str) -> str:
 def extract_predicted_choice_text(decoded: str, answer_choices: List[str]) -> str:
     cleaned = decoded.strip()
 
+    m = re.search(r"Answer:\s*(.+)", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if m:
+        candidate = m.group(1).strip().splitlines()[0].strip()
+        norm_candidate = normalize_text(candidate)
+
+        for choice in answer_choices:
+            if normalize_text(choice) == norm_candidate:
+                return choice.strip()
+
+        for choice in answer_choices:
+            norm_choice = normalize_text(choice)
+            if norm_choice and norm_choice in norm_candidate:
+                return choice.strip()
+
     # exact normalized match
     norm_output = normalize_text(cleaned)
     for choice in answer_choices:
@@ -178,7 +192,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--max-new-tokens", type=int, default=16)   # shorter for MCQ
+    parser.add_argument("--max-new-tokens", type=int, default=108)   # shorter for MCQ
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=50)
@@ -293,6 +307,7 @@ def prepare_answer_choices(raw_choices: List[str]) -> List[str]:
 def prepare_prompt(
     processor: LlavaNextProcessor,
     question: str,
+    hint: str,
     answer_choices: List[str],
     has_Image: bool,
     ) -> str:
@@ -324,9 +339,12 @@ def prepare_prompt(
         content.append({"type": "image"})
 
     prepared_choices = prepare_answer_choices(answer_choices)
-    choices_text = "\n".join(prepared_choices)
+    choices_text = "\n".join([f"{chr(65+i)}. {c}" for i, c in enumerate(prepared_choices)])
     content.append({"type": "text", "text": question})
+    if hint:
+        content.append({"type": "text", "text": f'Hint: {hint}'})
     content.append({"type": "text", "text": "Choices:\n" + choices_text})
+    content.append({"type": "text", "text": "Reasoning: "})
 
     conversation.append({
       "role": "user",
@@ -349,6 +367,7 @@ def generate_answer_scienceqa(
     # ---------- Extract fields ----------
     question_text = str(sample["question"])
     answer_choices = list(sample["choices"])
+    hint = str(sample.get("hint") or "").strip()
 
     gt_index = sample.get("answer", None)
     if isinstance(gt_index, int) and 0 <= gt_index < len(answer_choices):
@@ -365,10 +384,10 @@ def generate_answer_scienceqa(
 
     if has_image:
         image = image_obj.convert("RGB")
-        prompt = prepare_prompt(processor, question_text, answer_choices, True)
+        prompt = prepare_prompt(processor, question_text, hint, answer_choices, True)
         inputs = processor(images=image, text=prompt, return_tensors="pt")
     else:
-        prompt = prepare_prompt(processor, question_text, answer_choices, False)
+        prompt = prepare_prompt(processor, question_text, hint, answer_choices, False)
         inputs = processor(text=prompt, return_tensors="pt")
 
     inputs = move_batch_to_device(inputs, args.device, torch_dtype)
