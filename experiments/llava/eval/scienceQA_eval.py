@@ -27,6 +27,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, MutableMapping, Optional, Sequence, Tuple
 import sys
+from peft import PeftModel, PeftConfig
 
 from datasets import load_dataset, Dataset
 
@@ -57,6 +58,8 @@ class GenerationRecord:
     predicted_answer: str
     full_generation: str
     generation_latency_s: Optional[float] = None
+    prefill_time_s: Optional[float] = None
+    decode_time_s: Optional[float] = None
 
     def to_json(self) -> Dict[str, object]:
         return asdict(self)
@@ -69,6 +72,10 @@ class ScienceQAMetrics:
     accuracy: float
     average_latency_s: Optional[float] = None
     median_latency_s: Optional[float] = None
+    average_prefill_time_s: Optional[float] = None
+    median_prefill_time_s: Optional[float] = None
+    average_decode_time_s: Optional[float] = None
+    median_decode_time_s: Optional[float] = None
 
     def to_json(self) -> Dict[str, object]:
         return asdict(self)
@@ -80,9 +87,21 @@ def normalize_text(text: str) -> str:
     text = text.translate(str.maketrans("", "", string.punctuation))
     return text
 
+def choice_in_text(norm_choice: str, norm_text: str) -> bool:
+    # For short one-word choices like yes/no, require whole-word match.
+    if len(norm_choice.split()) == 1 and len(norm_choice) <= 3:
+        return re.search(rf"\b{re.escape(norm_choice)}\b", norm_text) is not None
+
+    return norm_choice in norm_text
+
 
 def extract_predicted_choice_text(decoded: str, answer_choices: List[str]) -> str:
     cleaned = decoded.strip()
+
+    def choice_in_text(norm_choice: str, norm_text: str) -> bool:
+        if len(norm_choice.split()) == 1 and len(norm_choice) <= 3:
+            return re.search(rf"\b{re.escape(norm_choice)}\b", norm_text) is not None
+        return norm_choice in norm_text
 
     m = re.search(r"Answer:\s*(.+)", cleaned, flags=re.IGNORECASE | re.DOTALL)
     if m:
@@ -95,25 +114,37 @@ def extract_predicted_choice_text(decoded: str, answer_choices: List[str]) -> st
 
         for choice in answer_choices:
             norm_choice = normalize_text(choice)
-            if norm_choice and norm_choice in norm_candidate:
+            if norm_choice and norm_candidate.startswith(norm_choice):
                 return choice.strip()
 
-    # exact normalized match
+        for choice in answer_choices:
+            norm_choice = normalize_text(choice)
+            if norm_choice and choice_in_text(norm_choice, norm_candidate):
+                return choice.strip()
+
+    first_line = cleaned.splitlines()[0] if cleaned else ""
+    norm_first = normalize_text(first_line)
+
+    for choice in answer_choices:
+        norm_choice = normalize_text(choice)
+        if norm_choice and choice_in_text(norm_choice, norm_first):
+            return choice.strip()
+
     norm_output = normalize_text(cleaned)
+
     for choice in answer_choices:
         if normalize_text(choice) == norm_output:
             return choice.strip()
 
-    # substring match: model says "the correct answer is mitochondria"
     for choice in answer_choices:
         norm_choice = normalize_text(choice)
-        if norm_choice and norm_choice in norm_output:
+        if norm_choice and choice_in_text(norm_choice, norm_output):
             return choice.strip()
 
-    # fallback: choose the most overlapping option
     output_words = set(norm_output.split())
     best_choice = ""
     best_score = -1
+
     for choice in answer_choices:
         choice_words = set(normalize_text(choice).split())
         score = len(output_words & choice_words)
@@ -187,7 +218,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--scienceqa-hf-dataset",
-        default="lmms-lab/ScienceQA-IMG",
+        default="derek-thomas/ScienceQA",
         help="HF dataset name to auto-download via datasets.load_dataset",
     )
 
@@ -224,9 +255,9 @@ def load_model_and_processor(
         "sampling_strategy": args.fna_sampling_strategy,
     }
 
-    model_source = args.checkpoint_path or args.model_id
-    logging.info("Loading LLaVA checkpoint from %s", model_source)
-    model = LlavaNextForConditionalGenerationFNA.from_pretrained(
+    model_source = args.model_id
+
+    base_model = LlavaNextForConditionalGenerationFNA.from_pretrained(
         model_source,
         torch_dtype=torch_dtype,
         low_cpu_mem_usage=True,
@@ -234,6 +265,14 @@ def load_model_and_processor(
         fna_config=fna_config,
         fna_cache={},
     )
+
+    if args.checkpoint_path is not None:
+        logging.info("Loading LoRA adapter from %s", args.checkpoint_path)
+        model = PeftModel.from_pretrained(base_model, args.checkpoint_path)
+    else:
+        model = base_model
+    
+
     model.eval()
     if args.device and (args.device_map in {None, "none"}):
         logging.info("Moving model to %s", args.device)
@@ -353,6 +392,74 @@ def prepare_prompt(
 
     return processor.apply_chat_template(conversation, add_generation_prompt=True)
 
+def timed_greedy_generate(model, inputs, tokenizer, max_new_tokens, device):
+    sync_fn = make_cuda_sync_fn(device)
+
+    # Prefill: full prompt forward pass
+    sync_fn()
+    t0 = time.perf_counter()
+
+    with torch.inference_mode():
+        out = model(
+            **inputs,
+            use_cache=True,
+            return_dict=True,
+        )
+
+    sync_fn()
+    prefill_time = time.perf_counter() - t0
+
+    # First generated token + KV cache
+    next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+    past = out.past_key_values
+
+    generated = [next_token]
+    attention_mask = inputs["attention_mask"]
+
+    # Decode: one token at a time
+    sync_fn()
+    t1 = time.perf_counter()
+
+    with torch.inference_mode():
+        for _ in range(max_new_tokens - 1):
+            if (
+                tokenizer.eos_token_id is not None
+                and next_token.item() == tokenizer.eos_token_id
+            ):
+                break
+
+            attention_mask = torch.cat(
+                [
+                    attention_mask,
+                    torch.ones(
+                        (attention_mask.shape[0], 1),
+                        dtype=attention_mask.dtype,
+                        device=attention_mask.device,
+                    ),
+                ],
+                dim=1,
+            )
+
+            out = model(
+                input_ids=next_token,
+                attention_mask=attention_mask,
+                past_key_values=past,
+                use_cache=True,
+                return_dict=True,
+            )
+
+            next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            past = out.past_key_values
+            generated.append(next_token)
+
+    sync_fn()
+    decode_time = time.perf_counter() - t1
+
+    generated_ids = torch.cat(generated, dim=1)
+    total_time = prefill_time + decode_time
+
+    return generated_ids, prefill_time, decode_time, total_time
+
 
 
 def generate_answer_scienceqa(
@@ -392,42 +499,9 @@ def generate_answer_scienceqa(
 
     inputs = move_batch_to_device(inputs, args.device, torch_dtype)
 
-    # ---------- Generation ----------
-    pad_token_id = (
-        processor.tokenizer.pad_token_id
-        or processor.tokenizer.eos_token_id
-    )
 
-    do_sample = args.temperature > 0
-
-    generation_kwargs = {
-        "max_new_tokens": args.max_new_tokens,
-        "do_sample": do_sample,
-        "use_cache": True,
-        "pad_token_id": pad_token_id,
-    }
-
-    if do_sample:
-        generation_kwargs.update({
-            "temperature": args.temperature,
-            "top_p": args.top_p,
-            "top_k": args.top_k,
-        })
-
-    sync_fn = make_cuda_sync_fn(args.device)
-
-    with torch.inference_mode():
-        sync_fn()
-        start = time.perf_counter()
-
-        output_ids = model.generate(**inputs, **generation_kwargs)
-
-        sync_fn()
-        latency = time.perf_counter() - start
-
-    prompt_len = inputs["input_ids"].shape[1]
-    generated_ids = output_ids[0][prompt_len:]
-    decoded = processor.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+    generated_ids, prefill_time, decode_time, total_time = timed_greedy_generate(model, inputs, processor.tokenizer, args.max_new_tokens, args.device)
+    decoded = processor.tokenizer.decode(generated_ids[0], skip_special_tokens=True).strip()
 
     
 
@@ -441,7 +515,9 @@ def generate_answer_scienceqa(
         ground_truth_answer=ground_truth_answer,
         predicted_answer=predicted_answer,
         full_generation=decoded,
-        generation_latency_s=latency,
+        generation_latency_s=total_time,
+        prefill_time_s=prefill_time,
+        decode_time_s=decode_time,
     )
 
 
@@ -523,6 +599,14 @@ def run_scienceqa_eval(args: argparse.Namespace) -> None:
     avg_latency = float(sum(latencies) / len(latencies)) if latencies else None
     median_latency = float(statistics.median(latencies)) if latencies else None
 
+    prefill_times = [rec.prefill_time_s for rec in predictions if rec.prefill_time_s is not None]
+    decode_times = [rec.decode_time_s for rec in predictions if rec.decode_time_s is not None]
+
+    avg_prefill_time = float(sum(prefill_times) / len(prefill_times)) if prefill_times else None
+    median_prefill_time = float(statistics.median(prefill_times)) if prefill_times else None
+    avg_decode_time = float(sum(decode_times) / len(decode_times)) if decode_times else None
+    median_decode_time = float(statistics.median(decode_times)) if decode_times else None
+
     num_correct = float(sum([1 for rec in predictions if normalize_text(rec.predicted_answer) == normalize_text(rec.ground_truth_answer)]))
     accuracy = float(num_correct/len(predictions))
     metrics = ScienceQAMetrics(
@@ -531,6 +615,10 @@ def run_scienceqa_eval(args: argparse.Namespace) -> None:
         accuracy=accuracy,
         average_latency_s=avg_latency,
         median_latency_s=median_latency,
+        average_prefill_time_s=avg_prefill_time,
+        median_prefill_time_s=median_prefill_time,
+        average_decode_time_s=avg_decode_time,
+        median_decode_time_s=median_decode_time,
     )
 
     dump_metrics(metrics_path, metrics)
