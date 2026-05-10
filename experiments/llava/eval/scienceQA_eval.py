@@ -60,6 +60,7 @@ class GenerationRecord:
     generation_latency_s: Optional[float] = None
     prefill_time_s: Optional[float] = None
     decode_time_s: Optional[float] = None
+    num_tokens_generated: Optional[int] = None
 
     def to_json(self) -> Dict[str, object]:
         return asdict(self)
@@ -76,6 +77,8 @@ class ScienceQAMetrics:
     median_prefill_time_s: Optional[float] = None
     average_decode_time_s: Optional[float] = None
     median_decode_time_s: Optional[float] = None
+    avg_num_tokens: Optional[float] = None
+    median_num_tokens: Optional[float] = None
 
     def to_json(self) -> Dict[str, object]:
         return asdict(self)
@@ -213,6 +216,7 @@ def parse_args() -> argparse.Namespace:
         choices=["fps", "random"],
         help="Sampling strategy used to select landmarks",
     )
+    parser.add_argument("--CLIP-feature-layer", type=int, default=-1, help="Which CLIP layer to take features from for FNA (counting from the end, -1 is the final layer)")
     parser.add_argument("--disable-fna", action="store_true")
     parser.add_argument("--verbose", action="store_true")
 
@@ -237,6 +241,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scienceqa-cache-dir", type=Path, default=None)
 
     parser.add_argument("--scienceqa-images-root", type=Path, default=None, help="Images root (local JSON mode only)")
+
+    parser.add_argument("--lower-bound", type=int, default=None, help="Optional index lower bound for processing a subset of the dataset (inclusive)")
+    parser.add_argument("--upper-bound", type=int, default=None, help="Optional index upper bound for processing a subset of the dataset (exclusive)")
 
     return parser.parse_args()
 
@@ -518,6 +525,7 @@ def generate_answer_scienceqa(
         generation_latency_s=total_time,
         prefill_time_s=prefill_time,
         decode_time_s=decode_time,
+        num_tokens_generated=generated_ids.shape[-1]
     )
 
 
@@ -570,14 +578,29 @@ def run_scienceqa_eval(args: argparse.Namespace) -> None:
     predictions_path = out_dir / "predictions.jsonl"
 
     model, processor = load_model_and_processor(args, dtype)
+
+    CLIP_LAYER = args.CLIP_feature_layer
+    if hasattr(model.config, "vision_feature_layer"):
+        model.config.vision_feature_layer = CLIP_LAYER
+        logging.info("Set CLIP feature layer to %d", CLIP_LAYER)
+    if hasattr(model.config, "mm_vision_select_layer"):
+        model.config.mm_vision_select_layer = CLIP_LAYER
+        logging.info("Set CLIP feature layer to %d", CLIP_LAYER)
     df = load_scienceqa_dataset(args)
 
     predictions: List[GenerationRecord] = read_existing_predictions(predictions_path)
     known_ids = set([row.question_id for row in predictions])
 
+    lower_bound = args.lower_bound if args.lower_bound and args.lower_bound > 0 and args.lower_bound < len(df) else 0
+    upper_bound = args.upper_bound if args.upper_bound and args.upper_bound > 0 and args.upper_bound < len(df) else len(df) - 1
 
-    progress = tqdm(enumerate(df), total=len(df), desc="Evaluating ScienceQA", unit="sample")
-    for i, row in progress:
+    subset_indices = range(lower_bound, upper_bound)
+    subset_length = upper_bound - lower_bound
+
+
+    progress = tqdm(subset_indices, total=subset_length, desc="Evaluating ScienceQA", unit="sample")
+    for i in progress:
+        row = df[i]
         idx = str(row.get("question_id", i))
         if idx in known_ids:
             continue
@@ -607,6 +630,10 @@ def run_scienceqa_eval(args: argparse.Namespace) -> None:
     avg_decode_time = float(sum(decode_times) / len(decode_times)) if decode_times else None
     median_decode_time = float(statistics.median(decode_times)) if decode_times else None
 
+    token_lengths = [prediction.num_tokens_generated for prediction in predictions if prediction.num_tokens_generated is not None]
+    avg_num_tokens = float(sum(token_lengths) / len(token_lengths)) if token_lengths else None
+    median_num_tokens = float(statistics.median(token_lengths)) if token_lengths else None
+
     num_correct = float(sum([1 for rec in predictions if normalize_text(rec.predicted_answer) == normalize_text(rec.ground_truth_answer)]))
     accuracy = float(num_correct/len(predictions))
     metrics = ScienceQAMetrics(
@@ -619,6 +646,8 @@ def run_scienceqa_eval(args: argparse.Namespace) -> None:
         median_prefill_time_s=median_prefill_time,
         average_decode_time_s=avg_decode_time,
         median_decode_time_s=median_decode_time,
+        avg_num_tokens=avg_num_tokens,
+        median_num_tokens=median_num_tokens,
     )
 
     dump_metrics(metrics_path, metrics)

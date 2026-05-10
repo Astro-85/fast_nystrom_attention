@@ -102,14 +102,19 @@ def sample_landmarks(
     # Batched FPS results (only used for fps mode)
     fps_idx_all: Optional[torch.Tensor] = None
     if sample_method == "fps" and Kmax > 0:
+        points_fps = points.detach().float().cpu()
+        restricted_mask_fps = restricted_mask.detach().cpu()
+
         fps_idx_all = torch_quickfps.sample(
-            points,
+            points_fps,
             Kmax,
-            mask=restricted_mask,
+            mask=restricted_mask_fps,
             h=8,
             low_d=8,
             return_points=False,
         )
+
+        fps_idx_all = fps_idx_all.to(device=device, dtype=torch.long)
     elif sample_method not in ("fps", "random"):
         raise ValueError(f"Unknown sample_method={sample_method!r}")
 
