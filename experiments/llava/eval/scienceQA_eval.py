@@ -357,6 +357,11 @@ def prepare_prompt(
     answer_choices: List[str],
     has_Image: bool,
     ) -> str:
+
+    LONG_CONTEXT = (
+        "This is filler context for measuring prefill latency. "
+        "Ignore this sentence when answering. "
+    ) * 200
     SYSTEM_PROMPT = """
     You are taking a multiple-choice exam.
 
@@ -386,6 +391,7 @@ def prepare_prompt(
 
     prepared_choices = prepare_answer_choices(answer_choices)
     choices_text = "\n".join([f"{chr(65+i)}. {c}" for i, c in enumerate(prepared_choices)])
+    #content.append({"type": "text", "text": f'{LONG_CONTEXT}\nQuestion: \n'})
     content.append({"type": "text", "text": question})
     if hint:
         content.append({"type": "text", "text": f'Hint: {hint}'})

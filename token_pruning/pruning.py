@@ -3,33 +3,33 @@ the latent token space passed to the multi-modal projector. """
 from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
+from dataclasses import dataclass
 
-def normalize_pruning_config(config: Dict) -> Dict:
-    confg = dict(config) if config is not None else {}
-    confg.setdefault("patch_dim", 256)
-    confg.setdefault("embedding_dim", 512)
-    confg.setdefault("pruning_num_latents", 32)
-    confg.setdefault("pruning_num_layers", 1)
-    confg.setdefault("pruning_num_heads", 8)
-    confg.setdefault("pruning_mlp_ratio", 4.0)
-    confg.setdefault("pruning_dropout", 0.0)
-    confg.setdefault("codebook_size", 1024)
-    confg.setdefault("commitment_loss_weight", 0.25)
-    return confg
+@dataclass
+class PruneConfig:
+    patch_dim: int = 256
+    embedding_dim: int = 512
+    pruning_num_latents: int = 32
+    pruning_num_layers: int = 2
+    pruning_num_heads: int = 8
+    pruning_mlp_ratio: float = 4.0
+    pruning_dropout: float = 0.0
+    codebook_size: int = 1024
+    commitment_loss_weight: float = 0.25
 
 
 
 class LlavaNextCompressor(nn.Module):
-    def __init__(self, config: Dict):
+    def __init__(self, config: PruneConfig):
         super().__init__()
-        self.config = normalize_pruning_config(config)
-        self.D = self.config["embedding_dim"]
-        self.K = self.config["pruning_num_latents"]
-        self.num_layers = self.config["pruning_num_layers"]
-        self.num_heads = self.config["pruning_num_heads"]
-        self.mlp_ratio = self.config["pruning_mlp_ratio"]
-        self.dropout = self.config["pruning_dropout"]
-        self.codebook_size = self.config["codebook_size"]
+        self.config = config
+        self.D = config.embedding_dim
+        self.K = config.pruning_num_latents
+        self.num_layers = config.pruning_num_layers
+        self.num_heads = config.pruning_num_heads
+        self.mlp_ratio = config.pruning_mlp_ratio
+        self.dropout = config.pruning_dropout
+        self.codebook_size = config.codebook_size
 
         if self.D % self.num_heads != 0:
             raise ValueError(f"Embedding dimension {self.D} must be divisible by number of heads {self.num_heads}")
@@ -70,7 +70,7 @@ class LlavaNextCompressor(nn.Module):
         quantized = self.codebook(indices).view(B, self.K, self.D)
         quantized_st = latents + (quantized - latents).detach()
 
-        beta = self.config["commitment_loss_weight"]
+        beta = self.config.commitment_loss_weight
 
         codebook_loss = ((quantized - latents.detach())**2).mean()
         commitment_loss = ((latents - quantized.detach())**2).mean()

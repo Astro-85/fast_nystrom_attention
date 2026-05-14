@@ -102,54 +102,14 @@ def sample_landmarks(
     # Batched FPS results (only used for fps mode)
     fps_idx_all: Optional[torch.Tensor] = None
     if sample_method == "fps" and Kmax > 0:
-
-        B, _, _ = points.shape
-
-        fps_idx_all = torch.zeros((B, Kmax), dtype=torch.long, device=device)
-
-        for i, batch in enumerate(points):
-            batch = [(point, j) for j, point in enumerate(batch)]
-            valid_points = [
-                p for p, keep in zip(batch, restricted_mask[i])
-                if bool(keep)
-            ]
-
-            if len(valid_points) < Kmax:
-                raise ValueError("not enough points to sample from")
-
-            rejected_points = []
-
-            selected_points = [valid_points.pop()]
-
-            for j in range(1, Kmax):
-                curr_largest = -1
-                point_iter = None
-
-                for k in range(len(valid_points)):
-                    minDist = min([torch.norm(valid_points[k][0] - point[0]) for point in selected_points])
-                    if(minDist > curr_largest):
-                        if point_iter is not None:
-                            rejected_points.append(point_iter)
-                        curr_largest= minDist
-                        point_iter = valid_points[k]
-
-                    else:
-                        rejected_points.append(valid_points[k])
-
-                selected_points.append(point_iter)
-                valid_points = rejected_points[:]
-                rejected_points = []
-
-            fps_idx_all[i] = torch.tensor(
-                [point[1] for point in selected_points],
-                dtype=torch.long,
-                device=device,
-            )
-
-        fps_idx_all = fps_idx_all.to(device=device, dtype=torch.long)
-
-
-
+        fps_idx_all = torch_quickfps.sample(
+            points,
+            Kmax,
+            mask=restricted_mask,
+            h=8,
+            low_d=8,
+            return_points=False,
+        )
     elif sample_method not in ("fps", "random"):
         raise ValueError(f"Unknown sample_method={sample_method!r}")
 
