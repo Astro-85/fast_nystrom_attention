@@ -779,6 +779,8 @@ class LlamaModelFNA(LlamaModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
+        is_prefill = cache_position is not None and cache_position.numel() > 1
+
         sample_indices = None
         mask_dict = self.fna_cache.get("mask_dict", {})
         fna_layers = self.fna_config["fna_layers"]
@@ -801,7 +803,7 @@ class LlamaModelFNA(LlamaModel):
                 "position_embeddings": position_embeddings,
             }
             
-            if has_image_tokens and layer_idx in fna_layers:
+            if is_prefill and layer_idx in fna_layers:
                 sample_indices = _resolve_layer_sample_indices(
                     sampling_features=sampling_features,
                     resample_every_layer=resample_every_layer,
@@ -830,7 +832,7 @@ class LlamaModelFNA(LlamaModel):
 
             hidden_states = layer_outputs[0]
 
-            if has_image_tokens and layer_idx in fna_layers:
+            if is_prefill and layer_idx in fna_layers:
                 sample_indices = _update_cached_sample_indices(
                     sampling_features=sampling_features,
                     resample_every_layer=resample_every_layer,
@@ -970,6 +972,7 @@ class LlavaNextForConditionalGenerationFNA(LlavaNextForConditionalGeneration, FN
         else:
             has_image_tokens = False
             n_image_tokens = None
+            self.fna_cache["mask_dict"] = {}
 
         outputs = self.language_model(
             attention_mask=attention_mask,

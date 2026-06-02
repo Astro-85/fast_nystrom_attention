@@ -29,6 +29,8 @@ from typing import Callable, Dict, List, MutableMapping, Optional, Sequence, Tup
 import sys
 from peft import PeftModel, PeftConfig
 
+import string
+
 from datasets import load_dataset, Dataset
 
 import torch
@@ -60,7 +62,6 @@ class GenerationRecord:
     generation_latency_s: Optional[float] = None
     prefill_time_s: Optional[float] = None
     decode_time_s: Optional[float] = None
-    num_tokens_generated: Optional[int] = None
 
     def to_json(self) -> Dict[str, object]:
         return asdict(self)
@@ -77,8 +78,6 @@ class ScienceQAMetrics:
     median_prefill_time_s: Optional[float] = None
     average_decode_time_s: Optional[float] = None
     median_decode_time_s: Optional[float] = None
-    avg_num_tokens: Optional[float] = None
-    median_num_tokens: Optional[float] = None
 
     def to_json(self) -> Dict[str, object]:
         return asdict(self)
@@ -98,64 +97,36 @@ def choice_in_text(norm_choice: str, norm_text: str) -> bool:
     return norm_choice in norm_text
 
 
-def extract_predicted_choice_text(decoded: str, answer_choices: List[str]) -> str:
-    cleaned = decoded.strip()
+def get_letters(num_choices: int):
+    return list(string.ascii_uppercase[:num_choices])
 
-    def choice_in_text(norm_choice: str, norm_text: str) -> bool:
-        if len(norm_choice.split()) == 1 and len(norm_choice) <= 3:
-            return re.search(rf"\b{re.escape(norm_choice)}\b", norm_text) is not None
-        return norm_choice in norm_text
 
-    m = re.search(r"Answer:\s*(.+)", cleaned, flags=re.IGNORECASE | re.DOTALL)
+def extract_predicted_choice_letter(decoded: str, num_choices: int) -> str:
+    valid_letters = get_letters(num_choices)
+    text = decoded.strip()
+
+    if text in valid_letters:
+        return text
+
+    m = re.search(r"Answer:\s*([A-Z])", text, flags=re.IGNORECASE)
     if m:
-        candidate = m.group(1).strip().splitlines()[0].strip()
-        norm_candidate = normalize_text(candidate)
+        letter = m.group(1).upper()
+        if letter in valid_letters:
+            return letter
 
-        for choice in answer_choices:
-            if normalize_text(choice) == norm_candidate:
-                return choice.strip()
+    m = re.search(r"The answer is\s*([A-Z])", text, flags=re.IGNORECASE)
+    if m:
+        letter = m.group(1).upper()
+        if letter in valid_letters:
+            return letter
 
-        for choice in answer_choices:
-            norm_choice = normalize_text(choice)
-            if norm_choice and norm_candidate.startswith(norm_choice):
-                return choice.strip()
+    m = re.match(r"\s*([A-Z])[\.\)]", text)
+    if m:
+        letter = m.group(1).upper()
+        if letter in valid_letters:
+            return letter
 
-        for choice in answer_choices:
-            norm_choice = normalize_text(choice)
-            if norm_choice and choice_in_text(norm_choice, norm_candidate):
-                return choice.strip()
-
-    first_line = cleaned.splitlines()[0] if cleaned else ""
-    norm_first = normalize_text(first_line)
-
-    for choice in answer_choices:
-        norm_choice = normalize_text(choice)
-        if norm_choice and choice_in_text(norm_choice, norm_first):
-            return choice.strip()
-
-    norm_output = normalize_text(cleaned)
-
-    for choice in answer_choices:
-        if normalize_text(choice) == norm_output:
-            return choice.strip()
-
-    for choice in answer_choices:
-        norm_choice = normalize_text(choice)
-        if norm_choice and choice_in_text(norm_choice, norm_output):
-            return choice.strip()
-
-    output_words = set(norm_output.split())
-    best_choice = ""
-    best_score = -1
-
-    for choice in answer_choices:
-        choice_words = set(normalize_text(choice).split())
-        score = len(output_words & choice_words)
-        if score > best_score:
-            best_score = score
-            best_choice = choice.strip()
-
-    return best_choice if best_score > 0 else cleaned
+    return "FAILED"
 
 """
 Obsolete logit processor allowing single character outputs.
@@ -241,9 +212,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scienceqa-cache-dir", type=Path, default=None)
 
     parser.add_argument("--scienceqa-images-root", type=Path, default=None, help="Images root (local JSON mode only)")
-
-    parser.add_argument("--lower-bound", type=int, default=None, help="Optional index lower bound for processing a subset of the dataset (inclusive)")
-    parser.add_argument("--upper-bound", type=int, default=None, help="Optional index upper bound for processing a subset of the dataset (exclusive)")
 
     return parser.parse_args()
 
@@ -356,54 +324,51 @@ def prepare_prompt(
     hint: str,
     answer_choices: List[str],
     has_Image: bool,
-    ) -> str:
-
-    LONG_CONTEXT = (
-        "This is filler context for measuring prefill latency. "
-        "Ignore this sentence when answering. "
-    ) * 200
+) -> str:
     SYSTEM_PROMPT = """
-    You are taking a multiple-choice exam.
+You are taking a multiple-choice science exam.
 
-    Your task is to choose the correct option and explain your reasoning.
+Solve the problem using the image and hint if provided.
+Give the reasoning first, then give the final answer as a single option letter.
 
-    Rules:
-    - Use the image if one is provided.
-    - Use the hint if one is provided.
-    - Reason step by step using the available information.
-    - Then provide the final correct answer choice text.
+Output format:
+Reasoning: <your reasoning>
+Answer: <option letter>
+"""
 
-    Output format:
-    Reasoning: <your reasoning>
-    Answer: <exact answer choice text>
-    """
-
-    conversation = []
-    conversation.append({
-      "role": "system",
-      "content": [
-        {"type": "text", "text": SYSTEM_PROMPT}
-      ]
-    })
     content = []
+
     if has_Image:
         content.append({"type": "image"})
 
     prepared_choices = prepare_answer_choices(answer_choices)
-    choices_text = "\n".join([f"{chr(65+i)}. {c}" for i, c in enumerate(prepared_choices)])
-    #content.append({"type": "text", "text": f'{LONG_CONTEXT}\nQuestion: \n'})
+    choices_text = "\n".join(
+        [f"{chr(65+i)}. {c}" for i, c in enumerate(prepared_choices)]
+    )
+
     content.append({"type": "text", "text": question})
+
     if hint:
-        content.append({"type": "text", "text": f'Hint: {hint}'})
+        content.append({"type": "text", "text": f"Hint: {hint}"})
+
     content.append({"type": "text", "text": "Choices:\n" + choices_text})
-    content.append({"type": "text", "text": "Reasoning: "})
+    content.append({"type": "text", "text": "Reasoning:"})
 
-    conversation.append({
-      "role": "user",
-      "content": content
-    })
+    conversation = [
+        {
+            "role": "system",
+            "content": [{"type": "text", "text": SYSTEM_PROMPT}],
+        },
+        {
+            "role": "user",
+            "content": content,
+        },
+    ]
 
-    return processor.apply_chat_template(conversation, add_generation_prompt=True)
+    return processor.apply_chat_template(
+        conversation,
+        add_generation_prompt=True,
+    )
 
 def timed_greedy_generate(model, inputs, tokenizer, max_new_tokens, device):
     sync_fn = make_cuda_sync_fn(device)
@@ -491,9 +456,9 @@ def generate_answer_scienceqa(
 
     gt_index = sample.get("answer", None)
     if isinstance(gt_index, int) and 0 <= gt_index < len(answer_choices):
-        ground_truth_answer = answer_choices[gt_index].strip()
+        ground_truth_answer = get_letters(len(answer_choices))[gt_index]
     else:
-        ground_truth_answer = ""
+        ground_truth_answer = "FAILED"
 
     # Some splits may not provide explicit IDs
     question_id = str(sample.get("question_id", sample_index))
@@ -519,7 +484,7 @@ def generate_answer_scienceqa(
     
 
     # ---------- Extract predicted letter ----------
-    predicted_answer = extract_predicted_choice_text(decoded, answer_choices)
+    predicted_answer = extract_predicted_choice_letter(decoded, len(answer_choices))
 
     return GenerationRecord(
         question_id=question_id,
@@ -531,7 +496,6 @@ def generate_answer_scienceqa(
         generation_latency_s=total_time,
         prefill_time_s=prefill_time,
         decode_time_s=decode_time,
-        num_tokens_generated=generated_ids.shape[-1]
     )
 
 
@@ -597,16 +561,9 @@ def run_scienceqa_eval(args: argparse.Namespace) -> None:
     predictions: List[GenerationRecord] = read_existing_predictions(predictions_path)
     known_ids = set([row.question_id for row in predictions])
 
-    lower_bound = args.lower_bound if args.lower_bound and args.lower_bound > 0 and args.lower_bound < len(df) else 0
-    upper_bound = args.upper_bound if args.upper_bound and args.upper_bound > 0 and args.upper_bound < len(df) else len(df) - 1
 
-    subset_indices = range(lower_bound, upper_bound)
-    subset_length = upper_bound - lower_bound
-
-
-    progress = tqdm(subset_indices, total=subset_length, desc="Evaluating ScienceQA", unit="sample")
-    for i in progress:
-        row = df[i]
+    progress = tqdm(enumerate(df), total=len(df), desc="Evaluating ScienceQA", unit="sample")
+    for i, row in progress:
         idx = str(row.get("question_id", i))
         if idx in known_ids:
             continue
@@ -636,11 +593,10 @@ def run_scienceqa_eval(args: argparse.Namespace) -> None:
     avg_decode_time = float(sum(decode_times) / len(decode_times)) if decode_times else None
     median_decode_time = float(statistics.median(decode_times)) if decode_times else None
 
-    token_lengths = [prediction.num_tokens_generated for prediction in predictions if prediction.num_tokens_generated is not None]
-    avg_num_tokens = float(sum(token_lengths) / len(token_lengths)) if token_lengths else None
-    median_num_tokens = float(statistics.median(token_lengths)) if token_lengths else None
-
-    num_correct = float(sum([1 for rec in predictions if normalize_text(rec.predicted_answer) == normalize_text(rec.ground_truth_answer)]))
+    num_correct = float(sum([1 for rec in predictions if 
+        normalize_text(rec.predicted_answer) == normalize_text(rec.ground_truth_answer)
+        and rec.predicted_answer != "FAILED"
+        and rec.ground_truth_answer != "FAILED"]))
     accuracy = float(num_correct/len(predictions))
     metrics = ScienceQAMetrics(
         total_questions=len(predictions),
@@ -652,8 +608,6 @@ def run_scienceqa_eval(args: argparse.Namespace) -> None:
         median_prefill_time_s=median_prefill_time,
         average_decode_time_s=avg_decode_time,
         median_decode_time_s=median_decode_time,
-        avg_num_tokens=avg_num_tokens,
-        median_num_tokens=median_num_tokens,
     )
 
     dump_metrics(metrics_path, metrics)

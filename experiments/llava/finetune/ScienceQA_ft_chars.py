@@ -66,17 +66,18 @@ def set_seed(seed: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+
 SYSTEM_PROMPT = """
 You are taking a multiple-choice exam.
 
-Your task is to choose the correct option and provide the reasoning behind your choice.
+Your task is to choose the correct option and provide reasoning.
 
 Use the image if one is provided.
 Use the hint if one is provided.
 
 Output format:
 Reasoning: <your reasoning>
-Answer: <exact answer choice text>
+Answer: <single option letter only>
 """
 
 
@@ -100,29 +101,49 @@ class DataRow:
     def __get_ground_truth(self, data_row: dict) -> str | None:
         answer = data_row.get("answer", None)
         choices = data_row.get("choices", None)
+
         if answer is None or choices is None:
             raise ValueError("Data row is missing 'answer' or 'choices' field")
+
+        letter = chr(65 + int(answer))   # 0->A, 1->B, etc.
         reasoning = data_row.get("solution", "").strip()
-        fin_ans = f"{reasoning}\nAnswer: {choices[answer]}" if reasoning else f"Answer: {choices[answer]}"
+
+        if reasoning:
+            fin_ans = f"{reasoning}\nAnswer: {letter}"
+        else:
+            fin_ans = f"Answer: {letter}"
+
         return fin_ans
+
+
 
     def __prepare_prompt(self, data_row: dict, processor: LlavaNextProcessor) -> str | None:
         question = data_row.get("question", None)
-        choices  = data_row.get("choices", None)
+        choices = data_row.get("choices", None)
+
         if question is None or choices is None:
             raise ValueError("Data row is missing 'question' field")
 
-        choices_text = "\n".join([f"{chr(65+i)}. {c}" for i, c in enumerate(choices)])
+        choices_text = "\n".join(
+            [f"{chr(65+i)}. {choice}" for i, choice in enumerate(choices)]
+        )
 
         content = []
+
         if self.has_image:
             content.append({"type": "image"})
-        content.append({"type": "text", "text": question})
-        if self.hint:
-            content.append({"type": "text", "text": f'Hint: {self.hint}'})
-        content.append({"type": "text", "text": "Choices:\n" + choices_text})
-        content.append({"type": "text", "text": "Reasoning: "})
 
+        content.append({"type": "text", "text": question})
+
+        if self.hint:
+            content.append({"type": "text", "text": f"Hint: {self.hint}"})
+
+        content.append({"type": "text", "text": "Choices:\n" + choices_text})
+
+        content.append({
+            "type": "text",
+            "text": "Give reasoning first, then output only the correct letter.\nReasoning:"
+        })
 
         conversation = [
             {
@@ -135,7 +156,10 @@ class DataRow:
             },
         ]
 
-        return processor.apply_chat_template(conversation, add_generation_prompt=False)
+        return processor.apply_chat_template(
+            conversation,
+            add_generation_prompt=False
+        )
 
 
 
